@@ -1,0 +1,29 @@
+#This is the transformation catalog.
+#
+#It comes pre-configured with a number of simple transformations with
+#paths that are likely to work on a linux box. However, on some systems,
+#the paths to these executables will be different (for example, sometimes
+#some of these programs are found in /usr/bin rather than in /bin)
+#
+#NOTE WELL: fields in this file must be separated by tabs, not spaces; and
+#there must be no trailing whitespace at the end of each line.
+#
+# sitename  transformation  path   INSTALLED  platform  profiles
+localhost 	echo 		/bin/echo	INSTALLED	INTEL32::LINUX	null
+localhost 	cat 		/bin/cat	INSTALLED	INTEL32::LINUX	null
+localhost 	ls 		/bin/ls		INSTALLED	INTEL32::LINUX	null
+localhost 	wc 		/usr/bin/wc		INSTALLED	INTEL32::LINUX	null
+localhost 	grep 		/bin/grep	INSTALLED	INTEL32::LINUX	null
+localhost 	sort 		/usr/bin/sort	INSTALLED	INTEL32::LINUX	null
+localhost 	paste 		/bin/paste	INSTALLED	INTEL32::LINUX	null
+localhost	which		/usr/bin/which	INSTALLED	INTEL32::LINUX  null
+localhost	perl		/usr/bin/perl	INSTALLED	INTEL32::LINUX	null
+localhost	csplit		/usr/bin/csplit	INSTALLED	INTEL32::LINUX	null
+localhost	pwd		/bin/pwd	INSTALLED	INTEL32::LINUX	null
+localhost	sh		/bin/sh		INSTALLED	INTEL32::LINUX	null
+localhost	sleep		/bin/sleep	INSTALLED	INTEL32::LINUX	null
+localhost	merge2	/home/quanpt/assi/swift/sort/merge2.pl	INSTALLED	INTEL32::LINUX	null
+#localhost	wordcount	/var/tmp/quanpt/swift/scripts/wc/wc.pl	INSTALLED	INTEL32::LINUX	null
+#localhost	mergewc	/var/tmp/quanpt/swift/scripts/wc/mergewc.pl	INSTALLED	INTEL32::LINUX	null
+#localhost	getid	/var/tmp/quanpt/swift/scripts/id/getid.pl	INSTALLED	INTEL32::LINUX	null
+localhost	split	/home/quanpt/assi/swift/sort/split.sh	INSTALLED	INTEL32::LINUX	null

@@ -1,0 +1,370 @@
+/*******************************************************************************
+ * INPUTS
+ *    conditionally-defined vars from CMakeLists.txt
+ * OUTPUTS
+ *    defs to config.h
+ * DEF RULES
+ *    cmakedefine VAR 1:
+ *        --> no def if VAR not defined by CMakeLists.txt
+ *        --> def to 1 if VAR defined by CMakeLists.txt
+ *    cmakedefine01 VAR
+ *        --> def to 0 if VAR not defined by CMakeLists.txt
+ *        --> def to 1 if VAR defined by CMakeLists.txt
+ ******************************************************************************/
+
+/*******************************************************************************
+ * TYPES AVAILABLE
+ ******************************************************************************/
+
+/* gid_t type available (from sys/types.h) */
+#cmakedefine HAVE_GID_T 1
+
+/* struct ia64_fpreg type available (from signal.h) */
+#cmakedefine HAVE_STRUCT_IA64_FPREG 1
+
+/* long long type available */
+#cmakedefine HAVE_LONG_LONG 1
+
+/* mode_t type available (from sys/types.h) */
+#cmakedefine HAVE_MODE_T 1
+
+/* struct msghdr member msg_control (from sys/procfs.h) available */
+#cmakedefine HAVE_STRUCT_MSGHDR_MSG_CONTROL 1
+
+/* off_t type available (from sys/types.h) */
+#cmakedefine HAVE_OFF_T 1
+
+/* off_t type available (from sys/types.h) and is a long long */
+#cmakedefine HAVE_LONG_LONG_OFF_T 1
+
+/* struct __old_kernel_stat type available (from asm/stat.h) */
+#cmakedefine HAVE_STRUCT___OLD_KERNEL_STAT 1
+
+/* struct opthdr type available (from sys/socket.h) */
+#cmakedefine HAVE_STRUCT_OPTHDR 1
+
+/* struct prstatus member pr_syscall (from sys/procfs.h) available */
+#cmakedefine HAVE_PR_SYSCALL 1
+
+/* struct pt_all_user_regs type available (from sys/ptrace.h) */
+#cmakedefine HAVE_STRUCT_PT_ALL_USER_REGS 1
+
+/* rlim_t type available (from sys/resource.h) */
+#cmakedefine HAVE_RLIM_T 1
+
+/* rlim_t type available (from sys/resource.h) and is a long long */
+#cmakedefine HAVE_LONG_LONG_RLIM_T 1
+
+/* sig_atomic_t type available (from signal.h) */
+#cmakedefine HAVE_SIG_ATOMIC_T 1
+
+/* struct sigcontext type available (from asm/sigcontext.h) */
+#cmakedefine HAVE_STRUCT_SIGCONTEXT 1
+
+/* struct sigcontext_struct type available (from asm/sigcontext.h) */
+#cmakedefine HAVE_STRUCT_SIGCONTEXT_STRUCT 1
+
+/* siginfo_t type available (from signal.h) */
+#cmakedefine HAVE_SIGINFO_T 1
+
+/* struct sockaddr_in6 member sin6_scope_id (from netinet/in.h) available */
+#cmakedefine HAVE_STRUCT_SOCKADDR_IN6_SIN6_SCOPE_ID 1
+
+/* struct stat member st_aclcnt (from sys/stat.h) available */
+#cmakedefine HAVE_STRUCT_STAT_ST_ACLCNT 1
+
+/* struct stat member st_blksize (from sys/stat.h) available */
+#cmakedefine HAVE_STRUCT_STAT_ST_BLKSIZE 1
+
+/* struct stat member st_blocks (from sys/stat.h) available */
+#cmakedefine HAVE_STRUCT_STAT_ST_BLOCKS 1
+
+/* struct stat member st_flags (from sys/stat.h) available */
+#cmakedefine HAVE_STRUCT_STAT_ST_FLAGS 1
+
+/* struct stat member st_fstype (from sys/stat.h) available */
+#cmakedefine HAVE_STRUCT_STAT_ST_FSTYPE 1
+
+/* struct stat member st_gen (from sys/stat.h) available */
+#cmakedefine HAVE_STRUCT_STAT_ST_GEN 1
+
+/* struct stat member st_level (from sys/stat.h) available */
+#cmakedefine HAVE_STRUCT_STAT_ST_LEVEL 1
+
+/* struct stat member st_rdev (from sys/stat.h) available */
+#cmakedefine HAVE_STRUCT_STAT_ST_RDEV 1
+
+/* stat64 type available (from asm/stat.h) */
+#cmakedefine HAVE_STAT64 1
+
+/* statfs64 type available (from sys/vfs.h or sys/statfs.h) */
+#cmakedefine HAVE_STATFS64 1
+
+/* struct T_conn_res member ACCEPTOR_id (from sys/stream.h) available */
+#cmakedefine HAVE_STRUCT_T_CONN_RES_ACCEPTOR_ID 1
+
+/* struct T_conn_res member QUEUE_ptr (from sys/stream.h) available */
+#cmakedefine HAVE_STRUCT_T_CONN_RES_QUEUE_PTR 1
+
+/* struct t_opthdr type available (from sys/tiuser.h) */
+#cmakedefine HAVE_STRUCT_T_OPTHDR 1
+
+/* uid_t type available (from sys/types.h) */
+#cmakedefine HAVE_UID_T 1
+
+/* struct user_desc type available (from asm/ldt.h) */
+#cmakedefine HAVE_STRUCT_USER_DESC 1
+
+/*******************************************************************************
+ * VARS AVAILABLE
+ ******************************************************************************/
+
+/* environ (from unistd.h) var available */
+#cmakedefine01 HAVE_DECL_ENVIRON
+
+/* sys_siglist (from signal.h) var available */
+#cmakedefine01 HAVE_DECL_SYS_SIGLIST
+
+/* _sys_siglist (from signal.h) var available */
+#cmakedefine01 HAVE_DECL__SYS_SIGLIST
+
+/* major, minor, and makedev (from mkdev.h) var available */
+#cmakedefine MAJOR_IN_MKDEV 1
+
+/* major, minor, and makedev (from sysmacros.h) var available */
+#cmakedefine MAJOR_IN_SYSMACROS 1
+
+/*******************************************************************************
+ * FUNCTIONS AVAILABLE
+ ******************************************************************************/
+
+/* alloca function is available */
+#cmakedefine HAVE_ALLOCA 1
+
+/* fork function is available */
+#cmakedefine HAVE_FORK 1
+
+/* fprintf function is available */
+#cmakedefine01 HAVE_DECL_FPRINTF
+
+/* getenv function is available */
+#cmakedefine01 HAVE_DECL_GETENV
+
+/* clearenv function is available */
+#cmakedefine HAVE_CLEARENV 1
+
+/* getopt function is available */
+#cmakedefine HAVE_DECL_GETOPT 1
+
+/* if_indextoname function is available */
+#cmakedefine HAVE_IF_INDEXTONAME 1
+
+/* inet_ntop function is available */
+#cmakedefine HAVE_INET_NTOP 1
+
+/* prctl function is available */
+#cmakedefine HAVE_PRCTL 1
+
+/* sbrk function is available */
+#cmakedefine01 HAVE_DECL_SBRK
+
+/* sbrk function is available (yes, duplicate used by the source) */
+#cmakedefine HAVE_SBRK 1
+
+/* sendmsg function is available */
+#cmakedefine HAVE_SENDMSG 1
+
+/* sigaction function is available */
+#cmakedefine HAVE_SIGACTION 1
+
+/* snprintf function is available */
+#cmakedefine01 HAVE_DECL_SNPRINTF
+
+/* stpcpy function is available */
+#cmakedefine01 HAVE_DECL_STPCPY
+
+/* strerror function is available */
+#cmakedefine HAVE_STRERROR 1
+
+/* strsignal function is available */
+#cmakedefine HAVE_STRSIGNAL 1
+
+/* strstr function is available */
+#cmakedefine01 HAVE_DECL_STRSTR
+
+/* sys_errlist function is available */
+#cmakedefine01 HAVE_DECL_SYS_ERRLIST
+
+/* sys_siglist function is available */
+#cmakedefine HAVE_SYS_SIGLIST 1
+
+/* _sys_siglist function is available */
+#cmakedefine HAVE__SYS_SIGLIST 1
+
+/* vsnprintf function is available */
+#cmakedefine01 HAVE_DECL_VSNPRINTF
+
+/*******************************************************************************
+ * INCLUDES AVAILABLE
+ ******************************************************************************/
+
+/* ANSI C (ISO C) headers are available */
+#cmakedefine STDC_HEADERS 1
+
+/* <alloca.h> header is available */
+#cmakedefine HAVE_ALLOCA_H 1
+
+/* <asm/cachectl.h> header is available */
+#cmakedefine HAVE_ASM_CACHECTL_H 1
+
+/* <asm/sigcontext.h> header is available */
+#cmakedefine HAVE_ASM_SIGCONTEXT_H 1
+
+/* <asm/sysmips.h> header is available */
+#cmakedefine HAVE_ASM_SYSMIPS_H 1
+
+/* <fcntl.h> header is available */
+#cmakedefine HAVE_FCNTL_H 1
+
+/* <inttypes.h> header is available */
+#cmakedefine HAVE_INTTYPES_H 1
+
+/* <ioctls.h> header is available */
+#cmakedefine HAVE_IOCTLS_H 1
+
+/* <libaio.h> header is available */
+#cmakedefine HAVE_LIBAIO_H 1
+
+/* <libintl.h> header is available */
+#cmakedefine HAVE_LIBINTL_H 1
+
+/* <limits.h> header is available */
+#cmakedefine HAVE_LIMITS_H 1
+
+/* <linux/capability.h> header is available */
+#cmakedefine HAVE_LINUX_CAPABILITY_H 1
+
+/* <linux/icmp.h> header is available */
+#cmakedefine HAVE_LINUX_ICMP_H 1
+
+/* <linux/if_packet.h> header is available */
+#cmakedefine HAVE_LINUX_IF_PACKET_H 1
+
+/* <linux/in6.h> header is available */
+#cmakedefine HAVE_LINUX_IN6_H 1
+
+/* <linux/netlink.h> header is available */
+#cmakedefine HAVE_LINUX_NETLINK_H 1
+
+/* <linux/ptrace.h> header is available */
+#cmakedefine HAVE_LINUX_PTRACE_H 1
+
+/* <mqueue.h> header is available */
+#cmakedefine HAVE_MQUEUE_H 1
+
+/* <netinet/sctp.h> header is available */
+#cmakedefine HAVE_NETINET_SCTP_H 1
+
+/* <netinet/tcp.h> header is available */
+#cmakedefine HAVE_NETINET_TCP_H 1
+
+/* <netinet/udp.h> header is available */
+#cmakedefine HAVE_NETINET_UDP_H 1
+
+/* <poll.h> header is available */
+#cmakedefine HAVE_POLL_H 1
+
+/* <stdbool.h> header is available */
+#cmakedefine HAVE_STDBOOL_H 1
+
+/* <stdint.h> header is available */
+#cmakedefine HAVE_STDINT_H 1
+
+/* <stdlib.h> header is available */
+#cmakedefine HAVE_STDLIB_H 1
+
+/* <string.h> header is available */
+#cmakedefine HAVE_STRING_H 1
+
+/* <strings.h> header is available */
+#cmakedefine HAVE_STRINGS_H 1
+
+/* <stropts.h> header is available */
+#cmakedefine HAVE_STROPTS_H 1
+
+/* <sys/acl.h> header is available */
+#cmakedefine HAVE_SYS_ACL_H 1
+
+/* <sys/aio.h> header is available */
+#cmakedefine HAVE_SYS_AIO_H 1
+
+/* <sys/asynch.h> header is available */
+#cmakedefine HAVE_SYS_ASYNCH_H 1
+
+/* <sys/conf.h> header is available */
+#cmakedefine HAVE_SYS_CONF_H 1
+
+/* <sys/door.h> header is available */
+#cmakedefine HAVE_SYS_DOOR_H 1
+
+/* <sys/epoll.h> header is available */
+#cmakedefine HAVE_SYS_EPOLL_H 1
+
+/* <sys/file.h> header is available */
+#cmakedefine HAVE_SYS_FILE_H 1
+
+/* <sys/filio.h> header is available */
+#cmakedefine HAVE_SYS_FILIO_H 1
+
+/* <sys/ioctl.h> header is available */
+#cmakedefine HAVE_SYS_IOCTL_H 1
+
+/* <sys/nscsys.h> header is available */
+#cmakedefine HAVE_SYS_NSCSYS_H 1
+
+/* <sys/param.h> header is available */
+#cmakedefine HAVE_SYS_PARAM_H 1
+
+/* <sys/poll.h> header is available */
+#cmakedefine HAVE_SYS_POLL_H 1
+
+/* <sys/reg.h> header is available */
+#cmakedefine HAVE_SYS_REG_H 1
+
+/* <sys/stream.h> header is available */
+#cmakedefine HAVE_SYS_STREAM_H 1
+
+/* <sys/sysconfig.h> header is available */
+#cmakedefine HAVE_SYS_SYSCONFIG_H 1
+
+/* <sys/tihdr.h> header is available */
+#cmakedefine HAVE_SYS_TIHDR_H 1
+
+/* <sys/tiuser.h> header is available */
+#cmakedefine HAVE_SYS_TIUSER_H 1
+
+/* <sys/uio.h> header is available */
+#cmakedefine HAVE_SYS_UIO_H 1
+
+/* <sys/vfs.h> header is available */
+#cmakedefine HAVE_SYS_VFS_H 1
+
+/* <termio.h> header is available */
+#cmakedefine HAVE_TERMIO_H 1
+
+/* <unistd.h> header is available */
+#cmakedefine HAVE_UNISTD_H 1
+
+/* <zlib.h> header is available */
+#cmakedefine HAVE_ZLIB_H 1
+
+/*******************************************************************************
+ * MISC ITEMS AVAILABLE
+ ******************************************************************************/
+
+/* machine is little-endian AND have the long long type */
+#cmakedefine HAVE_LITTLE_ENDIAN_LONG_LONG 1
+
+/* enable translation of prog msgs to user's lang in gettext.h functions */
+#cmakedefine ENABLE_NLS 1
+

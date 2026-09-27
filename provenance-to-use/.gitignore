@@ -1,0 +1,18 @@
+# PTU
+build/
+cde-package/
+ptu
+ptutest
+
+# VIM
+.vimrc
+.viminfo
+*.swp
+*.swo
+*~
+
+# SRC SUPPORT
+.ycm_extra_conf.py
+.clang_complete
+tags
+

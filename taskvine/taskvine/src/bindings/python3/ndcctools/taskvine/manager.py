@@ -1,0 +1,2426 @@
+# Copyright (C) 2022- The University of Notre Dame
+# This software is distributed under the GNU General Public License.
+# See the file COPYING for details.
+
+##
+# @namespace ndcctools.taskvine.manager
+#
+# This module provides the @ref ndcctools.taskvine.manager.Manager "Manager" class, which is neede in every TaskVine application.
+# It also provides the @ref ndcctools.taskvine.manager.Factory "Factory" class as a wrapper to the program vine_factory to
+# create workers from the python application.
+#
+
+from . import cvine
+
+from ndcctools.resource_monitor import (
+    rmsummary_delete,
+    rmsummary_create,
+    rmsummaryArray_getitem,
+    delete_rmsummaryArray,
+)
+
+from .display import JupyterDisplay
+from .file import File
+from .task import (
+    FunctionCall,
+    LibraryTask,
+    PythonTask,
+    Task,
+)
+from .utils import (
+    set_port_range,
+    get_c_constant,
+)
+
+import atexit
+import cloudpickle
+import errno
+import hashlib
+import itertools
+import re
+import json
+import math
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+
+##
+# @class ndcctools.taskvine.Manager
+# class ndcctools.taskvine.manager.Manager
+#
+# TaskVine Manager
+#
+# The manager class is the primary object for a TaskVine application.
+# To build an application, create a Manager instance, then create
+# @ref ndcctools.taskvine.task.Task objects and submit them with @ref ndcctools.taskvine.Manager.submit
+# Call @ref ndcctools.taskvine.manager.Manager.wait to wait for tasks to complete.
+# Run one or more vine_workers to perform work on behalf of the manager object.
+class Manager(object):
+    ##
+    # Create a new manager.
+    #
+    # @param self       Reference to the current manager object.
+    # @param port       The port number to listen on. If zero, then a random port is chosen. A range of possible ports (low, hight) can be also specified instead of a single integer. Default is 9123
+    # @param name       The project name to use.
+    # @param shutdown   Automatically shutdown workers when manager is finished. Disabled by default.
+    # @param run_info_path      Directory to archive workflow log directories, it is the upper level directory to run_info_template. If None, defaults to "vine-run-info"
+    # @param run_info_template  See run_info_path. If None, defaults by a %Y-%m-%dT%H%M%S format.
+    # @param staging_path Directory to write temporary files. Defaults to run_info_path if not given.
+    # @param ssl        A tuple of filenames (ssl_key, ssl_cert) in pem format, or True.
+    #                   If not given, then TSL is not activated. If True, a self-signed temporary key and cert are generated.
+    # @param init_fn    Function applied to the newly created manager at initialization.
+    # @param status_display_interval Number of seconds between updates to the jupyter status display. None, or less than 1 disables it.
+    #
+    # @see vine_create    - For more information about environmental variables that affect the behavior this method.
+    def __init__(self,
+                 port=cvine.VINE_DEFAULT_PORT,
+                 name=None,
+                 shutdown=False,
+                 run_info_path="vine-run-info",
+                 run_info_template=None,
+                 staging_path=None,
+                 ssl=None,
+                 init_fn=None,
+                 status_display_interval=None):
+        self._shutdown = shutdown
+        self._taskvine = None
+        self._stats = None
+        self._stats_hierarchy = None
+        self._task_table = {}
+        self._library_table = {}    # A table of all libraries known to the manager
+        self._info_widget = None
+        self._using_ssl = False
+        self._warm_mode = False     # activated below if TASKVINE_WARM_POOL is set
+
+        # Workflow timing metrics — populated by submit() and wait_for_tag() /
+        # wait_for_task_id() as the application runs.
+        self._metrics_first_submit  = None  # perf_counter() at first submit
+        self._metrics_last_result   = None  # perf_counter() at each completed task
+        self._metrics_task_exec_us  = []    # time_workers_execute_last per task (µs)
+
+        # Audit mode: record stable-key → worker mapping when VINE_AUDIT_MODE is set.
+        # Audit mode: record stable task key → worker mapping when VINE_AUDIT_MODE is set.
+        # Stable keys are computed at submit time from function bytecode + args and
+        # written to VINE_AUDIT_OUTPUT as a JSON file after each completed task.
+        # Subclasses (e.g. DaskVine) override _audit_tag_task() for framework-specific logic.
+        self._audit_mode   = os.environ.get('VINE_AUDIT_MODE', '0') not in ('', '0', 'false', 'False', 'no')
+        # Buffered in memory; flushed to disk at exit by _audit_flush atexit handler.
+        # Default: vine-audit-map.json in current working directory.
+        self._audit_output = os.environ.get('VINE_AUDIT_OUTPUT',
+                                             os.path.join(os.getcwd(), 'vine-audit-map.json'))
+        self._audit_map    = {}   # {stable_key: {"hostname": ..., "addrport": ...}}
+        if self._audit_mode:
+            atexit.register(self._audit_flush)
+
+        # Replay mode: route tasks to the workers that ran them originally.
+        # Set VINE_REPLAY_MODE=1; reads routing from VINE_AUDIT_OUTPUT (same path
+        # written by the original run).  Each matched task gets
+        # task.add_feature("env-<hostname>") to pin it to the apptainer worker.
+        self._replay_mode = os.environ.get('VINE_REPLAY_MODE', '0') not in ('', '0', 'false', 'False', 'no')
+        self._replay_map  = {}
+        if self._replay_mode:
+            try:
+                with open(self._audit_output) as _rf:
+                    self._replay_map = json.load(_rf)
+                print(f"[vine] replay mode: {len(self._replay_map)} task routes from {self._audit_output}")
+            except Exception as _re:
+                print(f"[vine] WARNING: could not load replay map {self._audit_output}: {_re}")
+        if staging_path:
+            self._staging_explicit = os.path.join(staging_path, "vine-staging")
+        else:
+            self._staging_explicit = None
+
+        set_port_range(port)
+
+        if status_display_interval and status_display_interval >= 1:
+            self._info_widget = JupyterDisplay(interval=status_display_interval)
+
+        try:
+            # Set an internal variable in the C code.
+            # No need to unset it explicitly as it doesn't rely on environment variables.
+            if run_info_path:
+                cvine.vine_set_runtime_info_path(run_info_path)
+
+            if run_info_template:
+                cvine.vine_set_runtime_info_template(run_info_template)
+
+            self._stats = cvine.vine_stats()
+            self._stats_hierarchy = cvine.vine_stats()
+
+            ssl_key, ssl_cert = self._setup_ssl(ssl, run_info_path)
+
+            # use port = 0, as a port range has been set with set_port_range
+            self._taskvine = cvine.vine_ssl_create(0, ssl_key, ssl_cert)
+
+            if ssl_key:
+                self._using_ssl = True
+
+            if not self._taskvine:
+                msg = "Could not create manager on:"
+                msg += f"\nport: {port}"
+                if run_info_path:
+                    msg += f"\nrun_info_path: {os.path.abspath(run_info_path)}"
+                if staging_path:
+                    msg += f"\nstaging_path: {os.path.abspath(staging_path)}"
+
+                raise Exception(msg)
+
+            if name:
+                cvine.vine_set_name(self._taskvine, name)
+
+            # support for PythonTask serialization:
+            self._function_buffers = {}
+            for d in ['outputs', 'arguments', 'functions']:
+                pathlib.Path.mkdir(pathlib.Path(self.staging_directory, d), exist_ok=True)
+
+            try:
+                if init_fn:
+                    init_fn(self)
+            except Exception:
+                sys.stderr.write("Something went wrong with the custom initialization function.")
+                raise
+            self._update_status_display()
+
+            # Activate warm-pool mode when requested via environment variable.
+            # All warm logic lives in warm_manager.py; the lazy import here keeps
+            # manager.py decoupled from it at module level.
+            if os.environ.get('TASKVINE_WARM_POOL', '0') not in ('', '0', 'false', 'False', 'no'):
+                from .warm_manager import _warm_init
+                _warm_init(self)
+                self._warm_mode = True
+
+            # In replay mode, collect library stderr from workers so failures are
+            # visible in library-logs/ instead of silently eaten on the worker side.
+            # NOTE: disabled — causes "Failed to insert key" hash table collisions
+            # on every task result. Re-enable only when debugging library failures.
+            # if self._replay_mode:
+            #     self.tune("watch-library-logfiles", 1)
+
+        except Exception:
+            sys.stderr.write("Unable to create internal taskvine structure.")
+            raise
+
+    def _free(self):
+        try:
+            if self._taskvine:
+                if self._shutdown:
+                    self.workers_shutdown(0)
+                self._update_status_display(force=True)
+                cvine.vine_delete(self._taskvine)
+                self._taskvine = None
+        except TypeError:
+            pass
+
+    def __del__(self):
+        self._free()
+
+    def _setup_ssl(self, ssl, run_info_path):
+        if not ssl:
+            return (None, None)
+
+        if ssl is not True:
+            return ssl
+
+        path = pathlib.Path(run_info_path)
+        if not path.exists():
+            path.mkdir(parents=True, exist_ok=True)
+
+        (tmp, key) = tempfile.mkstemp(dir=run_info_path, prefix="key")
+        os.close(tmp)
+        (tmp, cert) = tempfile.mkstemp(dir=run_info_path, prefix="cert")
+        os.close(tmp)
+
+        atexit.register(lambda: os.path.exists(key) and os.unlink(key))
+        atexit.register(lambda: os.path.exists(cert) and os.unlink(cert))
+
+        cmd = f"openssl req -x509 -newkey rsa:4096 -keyout {key} -out {cert} -sha256 -days 365 -nodes -batch".split()
+
+        output = ""
+        try:
+            output = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=True)
+        except subprocess.CalledProcessError as e:
+            print(f"could not create temporary SSL key and cert {e}.\n{output}")
+            raise e
+        return (key, cert)
+
+    def _update_status_display(self, force=False):
+        try:
+            if self._info_widget and self._info_widget.active():
+                self._info_widget.update(self, force)
+        except Exception as e:
+            # no exception should cause the queue to fail
+            print(f"status display error: {e}", file=sys.stderr)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exception_type, exception_value, traceback):
+        self._free()
+
+    ##
+    # Get the project name of the manager.
+    # @code
+    # >>> print(q.name)
+    # @endcode
+    @property
+    def name(self):
+        return cvine.vine_get_name(self._taskvine)
+
+    ##
+    # Get the listening port of the manager.
+    # @code
+    # >>> print(q.port)
+    # @endcode
+    @property
+    def port(self):
+        return cvine.vine_port(self._taskvine)
+
+    ##
+    # Whether the manager is using ssl to talk to workers
+    # @code
+    # >>> print(q.using_ssl)
+    # @endcode
+    @property
+    def using_ssl(self):
+        return self._using_ssl
+
+    ##
+    # Get the logs directory of the manager
+    @property
+    def logging_directory(self):
+        return cvine.vine_get_path_log(self._taskvine, None)
+
+    ##
+    # Get the staging directory of the manager
+    @property
+    def staging_directory(self):
+        if self._staging_explicit:
+            if not os.path.exists(self._staging_explicit):
+                path = pathlib.Path(self._staging_explicit)
+                path.mkdir(parents=True, exist_ok=True)
+            return self._staging_explicit
+        else:
+            return cvine.vine_get_path_staging(self._taskvine, None)
+
+    ##
+    # Get the library logs directory of the manager
+    @property
+    def library_logging_directory(self):
+        return cvine.vine_get_path_library_log(self._taskvine, None)
+
+    ##
+    # Get the caching directory of the manager
+    @property
+    def cache_directory(self):
+        return cvine.vine_get_path_cache(self._taskvine, None)
+
+    ##
+    # Get manager statistics.
+    # @code
+    # >>> print(q.stats)
+    # @endcode
+    # The fields in @ref ndcctools.taskvine.manager.Manager.stats can also be individually accessed through this call. For example:
+    # @code
+    # >>> print(q.stats.workers_busy)
+    # @endcode
+    @property
+    def stats(self):
+        cvine.vine_get_stats(self._taskvine, self._stats)
+        return self._stats
+
+    ##
+    # Get the task statistics for the given category.
+    #
+    # @param self   Reference to the current manager object.
+    # @param category   A category name.
+    # For example:
+    # @code
+    # s = q.stats_category("my_category")
+    # >>> print(s)
+    # @endcode
+    # The fields in @ref ndcctools.taskvine.manager.Manager.stats can also be individually accessed through this call. For example:
+    # @code
+    # >>> print(s.tasks_waiting)
+    # @endcode
+    def stats_category(self, category):
+        stats = cvine.vine_stats()
+        cvine.vine_get_stats_category(self._taskvine, category, stats)
+        return stats
+
+    ##
+    # Get manager information as list of dictionaries
+    # @param self Reference to the current manager object
+    # @param request One of: "manager", "tasks", "workers", or "categories"
+    # For example:
+    # @code
+    # import json
+    # tasks_info = q.status("tasks")
+    # @endcode
+    def status(self, request):
+        info_raw = cvine.vine_get_status(self._taskvine, request)
+        info_json = json.loads(info_raw)
+        del info_raw
+        return info_json
+
+    ##
+    # Get resource statistics of workers connected.
+    #
+    # @param self 	Reference to the current manager object.
+    # @return A list of dictionaries that indicate how many .workers
+    # connected with a certain number of .cores, .memory, and disk.
+    # For example:
+    # @code
+    # workers = q.summarize_workers()
+    # >>> for w in workers:
+    # >>>    print("{} workers with: {} cores, {} MB memory, {} MB disk".format(w.workers, w.cores, w.memory, w.disk)
+    # @endcode
+    def summarize_workers(self):
+        from_c = cvine.vine_summarize_workers(self._taskvine)
+
+        count = 0
+        workers = []
+        while True:
+            s = rmsummaryArray_getitem(from_c, count)
+            if not s:
+                break
+            workers.append({"workers": int(s.workers), "cores": int(s.cores), "gpus": int(s.gpus), "memory": int(s.memory), "disk": int(s.disk)})
+            rmsummary_delete(s)
+            count += 1
+        delete_rmsummaryArray(from_c)
+        return workers
+
+    ##
+    # Send update to catalog server.
+    #
+    # @param self 	Reference to the current manager object.
+    def update_catalog(self):
+        cvine.vine_update_catalog(self._taskvine)
+
+    ##
+    # Turn on or off first-allocation labeling for a given category. By
+    # default, only cores, memory, and disk are labeled, and gpus are unlabeled.
+    # NOTE: autolabeling is only meaningfull when task monitoring is enabled
+    # (@ref ndcctools.taskvine.manager.Manager.enable_monitoring). When monitoring is enabled and a task exhausts
+    # resources in a worker, mode dictates how taskvine handles the
+    # exhaustion:
+    # @param self Reference to the current manager object.
+    # @param category A category name. If None, sets the mode by default for
+    # newly created categories.
+    # @param mode One of:
+    #                  - "fixed" Task fails (default).
+    #                  - "max" If maximum values are
+    #                  specified for cores, memory, disk, and gpus (e.g. via @ref
+    #                  ndcctools.taskvine.manager.Manager.set_category_resources_max or @ref ndcctools.taskvine.task.Task.set_memory),
+    #                  and one of those resources is exceeded, the task fails.
+    #                  Otherwise it is retried until a large enough worker
+    #                  connects to the manager, using the maximum values
+    #                  specified, and the maximum values so far seen for
+    #                  resources not specified. Use @ref ndcctools.taskvine.task.Task.set_retries to
+    #                  set a limit on the number of times manager attemps
+    #                  to complete the task.
+    #                  - "min waste" As above, but
+    #                  manager tries allocations to minimize resource waste.
+    #                  - "max throughput" As above, but
+    #                  manager tries allocations to maximize throughput.
+    def set_category_mode(self, category, mode):
+        if isinstance(mode, str):
+            mode = get_c_constant(f"allocation_mode_{mode.replace(' ', '_')}")
+        return cvine.vine_set_category_mode(self._taskvine, category, mode)
+
+    ##
+    # Turn on or off first-allocation labeling for a given category and
+    # resource. This function should be use to fine-tune the defaults from @ref
+    # ndcctools.taskvine.manager.Manager.set_category_mode.
+    # @param self   Reference to the current manager object.
+    # @param category A category name.
+    # @param resource A resource name.
+    # @param autolabel True/False for on/off.
+    # @returns 1 if resource is valid, 0 otherwise.
+    def set_category_autolabel_resource(self, category, resource, autolabel):
+        return cvine.vine_enable_category_resource(self._taskvine, category, category, resource, autolabel)
+
+    ##
+    # Get current task state. See @ref vine_task_state_t for possible values.
+    # @param task_id  The task_id returned from @ref ndcctools.taskvine.manager.Manager.submit.
+    # @code
+    # >>> print(q.task_state(task_id))
+    # @endcode
+    def task_state(self, task_id):
+        return cvine.vine_task_state(self._taskvine, task_id)
+
+    ##
+    # Enables resource monitoring for tasks. The resources measured are
+    # available in the resources_measured member of the respective vine_task.
+    # @param self   Reference to the current manager object.
+    # @param watchdog If not 0, kill tasks that exhaust declared resources.
+    # @param time_series If not 0, generate a time series of resources per task
+    # in VINE_RUNTIME_INFO_DIR/vine-logs/time-series/ (WARNING: for long running
+    # tasks these files may reach gigabyte sizes. This function is mostly used
+    # for debugging.)
+    #
+    # Returns 1 on success, 0 on failure (i.e., monitoring was not enabled).
+    def enable_monitoring(self, watchdog=True, time_series=False):
+        return cvine.vine_enable_monitoring(self._taskvine, watchdog, time_series)
+
+    ##
+    # Enable P2P worker transfer functionality. On by default
+    #
+    # @param self Reference to the current manager object.
+    def enable_peer_transfers(self):
+        return cvine.vine_enable_peer_transfers(self._taskvine)
+
+    ##
+    # Disable P2P worker transfer functionality. On by default
+    #
+    # @param self Reference to the current manager object.
+    def disable_peer_transfers(self):
+        return cvine.vine_disable_peer_transfers(self._taskvine)
+
+    ##
+    # Change the project name for the given manager.
+    #
+    # @param self   Reference to the current manager object.
+    ##
+    # Enable disconnect slow workers functionality for a given manager for tasks in
+    # the "default" category, and for task which category does not set an
+    # explicit multiplier.
+    #
+    # @param self       Reference to the current manager object.
+    # @param multiplier The multiplier of the average task time at which point to disconnect a worker; if less than 1, it is disabled (default).
+    def enable_disconnect_slow_workers(self, multiplier):
+        return cvine.vine_enable_disconnect_slow_workers(self._taskvine, multiplier)
+
+    ##
+    # Enable disconnect slow workers functionality for a given manager.
+    #
+    # @param self       Reference to the current manager object.
+    # @param name       Name of the category.
+    # @param multiplier The multiplier of the average task time at which point to disconnect a worker; disabled if less than one (see @ref ndcctools.taskvine.manager.Manager.enable_disconnect_slow_workers)
+    def enable_disconnect_slow_workers_category(self, name, multiplier):
+        return cvine.vine_enable_disconnect_slow_workers_category(self._taskvine, name, multiplier)
+
+    ##
+    # Turn on or off draining mode for workers at hostname.
+    #
+    # @param self       Reference to the current manager object.
+    # @param hostname   The hostname the host running the workers.
+    # @param drain_mode If True, no new tasks are dispatched to workers at hostname, and empty workers are shutdown. Else, workers works as usual.
+    def set_draining_by_hostname(self, hostname, drain_mode=True):
+        return cvine.vine_set_draining_by_hostname(self._taskvine, hostname, drain_mode)
+
+    ##
+    # Determine whether there are any known tasks managerd, running, or waiting to be collected.
+    #
+    # Returns 0 if there are tasks remaining in the system, 1 if the system is "empty".
+    #
+    # @param self       Reference to the current manager object.
+    def empty(self):
+        return cvine.vine_empty(self._taskvine)
+
+    ##
+    # Determine whether the manager can support more tasks.
+    #
+    # Returns the number of additional tasks it can support if "hungry" and 0 if "sated".
+    #
+    # @param self       Reference to the current manager object.
+    def hungry(self):
+        return cvine.vine_hungry(self._taskvine)
+
+    ##
+    # Set the worker selection scheduler for manager.
+    #
+    # @param self       Reference to the current manager object.
+    # @param scheduler  One of the following schedulers set preference when assigning a
+    #                   task to a worker:
+    #                     - "files"         Prefer the available worker that has the most data required for the task.
+    #                     - "time"          Prefer the available worker that has completed previous tasks the fastest.
+    #                     - "rand"          Select a random available worker.
+    #                     - "worst"         Select a worker with the most unused resources (tie breakers: cores, memory, disk).
+    #                     - "disk"          Select a worker with the most unused disk.
+    def set_scheduler(self, scheduler):
+        sched = get_c_constant(f"schedule_{scheduler}")
+        return cvine.vine_set_scheduler(self._taskvine, sched)
+
+    ##
+    # Change the project name for the given manager.
+    #
+    # @param self   Reference to the current manager object.
+    # @param name   The new project name.
+    def set_name(self, name):
+        return cvine.vine_set_name(self._taskvine, name)
+
+    ##
+    # Set the preference for using hostname over IP address to connect.
+    # 'by_ip' uses IP addresses from the network interfaces of the manager
+    # (standard behavior), 'by_hostname' to use the hostname at the manager, or
+    # 'by_apparent_ip' to use the address of the manager as seen by the catalog
+    # server.
+    #
+    # @param self Reference to the current manager object.
+    # @param mode An string to indicate using 'by_ip', 'by_hostname' or 'by_apparent_ip'.
+    def set_manager_preferred_connection(self, mode):
+        return cvine.vine_set_manager_preferred_connection(self._taskvine, mode)
+
+    ##
+    # Set the minimum task_id of future submitted tasks.
+    #
+    # Further submitted tasks are guaranteed to have a task_id larger or equal
+    # to minid.  This function is useful to make task_ids consistent in a
+    # workflow that consists of sequential managers. (Note: This function is
+    # rarely used).  If the minimum id provided is smaller than the last task_id
+    # computed, the minimum id provided is ignored.
+    #
+    # @param self   Reference to the current manager object.
+    # @param minid  Minimum desired task_id
+    # @return Returns the actual minimum task_id for future tasks.
+    def set_min_task_id(self, minid):
+        return cvine.vine_set_task_id_min(self._taskvine, minid)
+
+    ##
+    # Change the project priority for the given manager.
+    #
+    # @param self       Reference to the current manager object.
+    # @param priority   An integer that presents the priorty of this manager manager. The higher the value, the higher the priority.
+    def set_priority(self, priority):
+        return cvine.vine_set_priority(self._taskvine, priority)
+
+    ##
+    # Specify the number of tasks not yet submitted to the manager.
+    # It is used by vine_factory to determine the number of workers to launch.
+    # If not specified, it defaults to 0.
+    # vine_factory considers the number of tasks as:
+    # num tasks left + num tasks running + num tasks read.
+    # @param self   Reference to the current manager object.
+    # @param ntasks Number of tasks yet to be submitted.
+    def tasks_left_count(self, ntasks):
+        return cvine.vine_set_tasks_left_count(self._taskvine, ntasks)
+
+    ##
+    # Specify the catalog servers the manager should report to.
+    #
+    # @param self       Reference to the current manager object.
+    # @param catalogs   The catalog servers given as a comma delimited list of hostnames or hostname:port
+    def set_catalog_servers(self, catalogs):
+        return cvine.vine_set_catalog_servers(self._taskvine, catalogs)
+
+    ##
+    # Add a global property to the manager which will be included in periodic
+    # reports to the catalog server and other telemetry destinations.
+    # This is helpful for distinguishing higher level information about the entire run,
+    # such as the name of the framework being used, or the logical name of the dataset
+    # being processed.
+    # @param self Reference to the current manager object.
+    # @param name The name of the property.
+    # @param value The value of the property.
+    def set_property(self, name, value):
+        cvine.vine_set_property(self._taskvine, name, value)
+
+    ##
+    # Add a mandatory password that each worker must present.
+    #
+    # @param self      Reference to the current manager object.
+    # @param password  The password.
+    def set_password(self, password):
+        return cvine.vine_set_password(self._taskvine, password)
+
+    ##
+    # Add a mandatory password file that each worker must present.
+    #
+    # @param self      Reference to the current manager object.
+    # @param file      Name of the file containing the password.
+
+    def set_password_file(self, file):
+        return cvine.vine_set_password_file(self._taskvine, file)
+
+    ##
+    #
+    # Specifies the maximum resources allowed for the default category.
+    # @param self      Reference to the current manager object.
+    # @param rmd       Dictionary indicating maximum values. See @ref ndcctools.taskvine.task.Task.resources_measured for possible fields.
+    # For example:
+    # @code
+    # >>> # A maximum of 4 cores is found on any worker:
+    # >>> q.set_resources_max({'cores': 4})
+    # >>> # A maximum of 8 cores, 1GB of memory, and 10GB disk are found on any worker:
+    # >>> q.set_resources_max({'cores': 8, 'memory':  1024, 'disk': 10240})
+    # @endcode
+
+    def set_resources_max(self, rmd):
+        if not rmd:
+            return
+
+        rm = rmsummary_create(-1)
+        for k in rmd:
+            setattr(rm, k, rmd[k])
+        result = cvine.vine_set_resources_max(self._taskvine, rm)
+        rmsummary_delete(rm)
+        return result
+
+    ##
+    #
+    # Specifies the minimum resources allowed for the default category.
+    # @param self      Reference to the current manager object.
+    # @param rmd       Dictionary indicating minimum values. See @ref ndcctools.taskvine.task.Task.resources_measured for possible fields.
+    # For example:
+    # @code
+    # >>> # A minimum of 2 cores is found on any worker:
+    # >>> q.set_resources_min({'cores': 2})
+    # >>> # A minimum of 4 cores, 512MB of memory, and 1GB disk are found on any worker:
+    # >>> q.set_resources_min({'cores': 4, 'memory':  512, 'disk': 1024})
+    # @endcode
+
+    def set_resources_min(self, rmd):
+        if not rmd:
+            return
+
+        rm = rmsummary_create(-1)
+        for k in rmd:
+            setattr(rm, k, rmd[k])
+        result = cvine.vine_set_resources_min(self._taskvine, rm)
+        rmsummary_delete(rm)
+        return result
+
+    ##
+    # Specifies the maximum resources allowed for the given category.
+    #
+    # @param self      Reference to the current manager object.
+    # @param category  Name of the category.
+    # @param rmd       Dictionary indicating maximum values. See @ref ndcctools.taskvine.task.Task.resources_measured for possible fields.
+    # For example:
+    # @code
+    # >>> # A maximum of 4 cores may be used by a task in the category:
+    # >>> q.set_category_resources_max("my_category", {'cores': 4})
+    # >>> # A maximum of 8 cores, 1GB of memory, and 10GB may be used by a task:
+    # >>> q.set_category_resources_max("my_category", {'cores': 8, 'memory':  1024, 'disk': 10240})
+    # @endcode
+
+    def set_category_resources_max(self, category, rmd):
+        if not rmd:
+            return
+
+        rm = rmsummary_create(-1)
+        for k in rmd:
+            setattr(rm, k, rmd[k])
+        result = cvine.vine_set_category_resources_max(self._taskvine, category, rm)
+        rmsummary_delete(rm)
+        return result
+
+    ##
+    # Specifies the minimum resources allowed for the given category.
+    #
+    # @param self      Reference to the current manager object.
+    # @param category  Name of the category.
+    # @param rmd       Dictionary indicating minimum values. See @ref ndcctools.taskvine.task.Task.resources_measured for possible fields.
+    # For example:
+    # @code
+    # >>> # A minimum of 2 cores is found on any worker:
+    # >>> q.set_category_resources_min("my_category", {'cores': 2})
+    # >>> # A minimum of 4 cores, 512MB of memory, and 1GB disk are found on any worker:
+    # >>> q.set_category_resources_min("my_category", {'cores': 4, 'memory':  512, 'disk': 1024})
+    # @endcode
+
+    def set_category_resources_min(self, category, rmd):
+        if not rmd:
+            return
+
+        rm = rmsummary_create(-1)
+        for k in rmd:
+            setattr(rm, k, rmd[k])
+        result = cvine.vine_set_category_resources_min(self._taskvine, category, rm)
+        rmsummary_delete(rm)
+        return result
+
+    ##
+    # Specifies the first-allocation guess for the given category
+    #
+    # @param self      Reference to the current manager object.
+    # @param category  Name of the category.
+    # @param rmd       Dictionary indicating maximum values. See @ref ndcctools.taskvine.task.Task.resources_measured for possible fields.
+    # For example:
+    # @code
+    # >>> # Tasks are first tried with 4 cores:
+    # >>> q.set_category_first_allocation_guess("my_category", {'cores': 4})
+    # >>> # Tasks are first tried with 8 cores, 1GB of memory, and 10GB:
+    # >>> q.set_category_first_allocation_guess("my_category", {'cores': 8, 'memory':  1024, 'disk': 10240})
+    # @endcode
+
+    def set_category_first_allocation_guess(self, category, rmd):
+        rm = rmsummary_create(-1)
+        for k in rmd:
+            setattr(rm, k, rmd[k])
+        result = cvine.vine_set_category_first_allocation_guess(self._taskvine, category, rm)
+        rmsummary_delete(rm)
+        return result
+
+    ##
+    # Specifies the maximum resources allowed for the given category.
+    #
+    # @param self      Reference to the current work queue object.
+    # @param category  Name of the category.
+    # @param max_concurrent Number of maximum concurrent tasks. Less then 0 means unlimited (this is the default).
+    # For example:
+    # @code
+    # >>> # Do not run more than 5 tasks of "my_category" concurrently:
+    # >>> q.set_category_max_concurrent("my_category", 5)
+    # @endcode
+    def set_category_max_concurrent(self, category, max_concurrent):
+        return cvine.vine_set_category_max_concurrent(self._work_queue, category, max_concurrent)
+
+    ##
+    # Initialize first value of categories
+    #
+    # @param self     Reference to the current manager object.
+    # @param rm       Dictionary indicating maximum values. See @ref ndcctools.taskvine.task.Task.resources_measured for possible fields.
+    # @param filename JSON file with resource summaries.
+
+    def initialize_categories(self, filename, rm):
+        return cvine.vine_initialize_categories(self._taskvine, rm, filename)
+
+    ##
+    # Cancel task identified by its task_id.
+    # The cancelled task will be returned in the normal way via @ref wait with a result of VINE_RESULT_CANCELLED.
+    #
+    # @param self   Reference to the current manager object.
+    # @param id     The task_id returned from @ref ndcctools.taskvine.manager.Manager.submit.
+    # @return One if the task was found and cancelled, zero otherwise.
+
+    def cancel_by_task_id(self, id):
+        return cvine.vine_cancel_by_task_id(self._taskvine, id)
+
+    ##
+    # Cancel task identified by its tag.
+    # The cancelled task will be returned in the normal way via @ref wait with a result of VINE_RESULT_CANCELLED.
+    #
+    # @param self   Reference to the current manager object.
+    # @param tag    The tag assigned to task using @ref ndcctools.taskvine.task.Task.set_tag.
+    # @return One if the task was found and cancelled, zero otherwise.
+
+    def cancel_by_task_tag(self, tag):
+        return cvine.vine_cancel_by_task_tag(self._taskvine, tag)
+
+    ##
+    # Cancel all tasks with the given tag.
+    # The cancelled tasks will be returned in the normal way via @ref wait with a result of VINE_RESULT_CANCELLED.
+    #
+    # @param self   Reference to the current manager object.
+    # @param tag    The tag assigned to tasks using @ref ndcctools.taskvine.task.Task.set_tag.
+    # @return The total number of tasks cancelled.
+    def cancel_all_by_tag(self, tag):
+        return cvine.vine_cancel_all_by_tag(self._taskvine, tag)
+
+    ##
+    # Cancel all tasks of the given category.
+    # The cancelled tasks will be returned in the normal way via @ref wait with a result of VINE_RESULT_CANCELLED.
+    #
+    # @param self   Reference to the current manager object.
+    # @param category The name of the category to cancel.
+    # @return The total number of tasks cancelled.
+    def cancel_by_category(self, category):
+        total = 0
+
+        for task in self._task_table.values():
+            if task.category == category:
+                total += self.cancel_by_task_id(task.id)
+
+        return total
+
+    ##
+    # Cancel all tasks.
+    # The cancelled tasks will be returned in the normal way via @ref wait with a result of VINE_RESULT_CANCELLED.
+    #
+    # @param self   Reference to the current manager object.
+    # @return The total number of tasks cancelled.
+    def cancel_all(self):
+        return cvine.vine_cancel_all(self._taskvine)
+
+    ##
+    # Shutdown workers connected to manager.
+    #
+    # Gives a best effort and then returns the number of workers given the shutdown order.
+    #
+    # @param self   Reference to the current manager object.
+    # @param n      The number to shutdown.  0 shutdowns all workers
+    def workers_shutdown(self, n=0):
+        return cvine.vine_workers_shutdown(self._taskvine, n)
+
+    ##
+    # Block workers running on host from working for the manager.
+    #
+    # @param self   Reference to the current manager object.
+    # @param host   The hostname the host running the workers.
+    def block_host(self, host):
+        return cvine.vine_block_host(self._taskvine, host)
+
+    ##
+    # Replaced by @ref ndcctools.taskvine.manager.Manager.block_host
+    def blacklist(self, host):
+        return self.block_host(host)
+
+    ##
+    # Block workers running on host for the duration of the given timeout.
+    #
+    # @param self    Reference to the current manager object.
+    # @param host    The hostname the host running the workers.
+    # @param timeout How long this block entry lasts (in seconds). If less than 1, block indefinitely.
+    def block_host_with_timeout(self, host, timeout):
+        return cvine.vine_block_host_with_timeout(self._taskvine, host, timeout)
+
+    ##
+    # See @ref ndcctools.taskvine.manager.Manager.block_host_with_timeout
+    def blacklist_with_timeout(self, host, timeout):
+        return self.block_host_with_timeout(host, timeout)
+
+    ##
+    # Unblock given host, of all hosts if host not given
+    #
+    # @param self   Reference to the current manager object.
+    # @param host   The of the hostname the host.
+    def unblock_host(self, host=None):
+        if host is None:
+            return cvine.vine_unblock_all(self._taskvine)
+        return cvine.vine_unblock_host(self._taskvine, host)
+
+    ##
+    # See @ref ndcctools.taskvine.manager.Manager.unblock_host
+    def blacklist_clear(self, host=None):
+        return self.unblock_host(host)
+
+    ##
+    # Change keepalive interval for a given manager.
+    #
+    # @param self     Reference to the current manager object.
+    # @param interval Minimum number of seconds to wait before sending new keepalive
+    #                 checks to workers.
+    def set_keepalive_interval(self, interval):
+        return cvine.vine_set_keepalive_interval(self._taskvine, interval)
+
+    ##
+    # Change keepalive timeout for a given manager.
+    #
+    # @param self     Reference to the current manager object.
+    # @param timeout  Minimum number of seconds to wait for a keepalive response
+    #                 from worker before marking it as dead.
+    def set_keepalive_timeout(self, timeout):
+        return cvine.vine_set_keepalive_timeout(self._taskvine, timeout)
+
+    ##
+    # Tune advanced parameters.
+    #
+    # @param self  Reference to the current manager object.
+    # @param name  The name fo the parameter to tune. Can be one of following:
+    # - "attempt-schedule-depth" The amount of tasks to attempt scheduling on each pass of send_one_task in the main loop. (default=100)
+    # - "category-steady-n-tasks" Set the number of tasks considered when computing category buckets.
+    # - "default-transfer-rate" The assumed network bandwidth used until sufficient data has been collected.  (1MB/s)
+    # - "disconnect-slow-workers-factor" Set the multiplier of the average task time at which point to disconnect a worker; disabled if less than 1. (default=0)
+    # - "hungry-minimum" Mimimum number of tasks to consider manager not hungry. (default=10)
+    # - "hungry-minimum-factor" Queue is hungry if number of waiting tasks is less than hungry-minumum-factor x (number of workers) | 2 |
+    # - "immediate-recovery" If set to 1, create recovery tasks for temporary files as soon as their worker disconnects. Otherwise, create recovery tasks only if the temporary files are used as input when trying to dispatch another task.
+    # - "keepalive-interval" Set the minimum number of seconds to wait before sending new keepalive checks to workers. (default=300)
+    # - "keepalive-timeout" Set the minimum number of seconds to wait for a keepalive response from worker before marking it as dead. (default=30)
+    # - "long-timeout" Set the minimum timeout in seconds when sending a large message to a single worker. (default=3600)
+    # - "max-retrievals" Sets the max number of tasks to retrieve per manager wait(). If less than 1, the manager prefers to retrieve all completed tasks before dispatching new tasks to workers. (default=1)
+    # - "min-transfer-timeout" Set the minimum number of seconds to wait for files to be transferred to or from a worker. (default=10)
+    # - "monitor-interval" Parameter to change how frequently the resource monitor records resource consumption of a task in a times series, if this feature is enabled. See @ref enable_monitoring.
+    # - "prefer-dispatch" If 1, try to dispatch tasks even if there are retrieved tasks ready to be reported as done. (default=0)
+    # - "proportional-resources" If set to 0, do not assign resources proportionally to tasks. The default is to use proportions.
+    # - "proportional-whole-tasks" Round up resource proportions such that only an integer number of tasks could be fit in the worker. The default is to use proportions.
+    # - "ramp-down-heuristic" If set to 1 and there are more workers than tasks waiting, then tasks are allocated all the free resources of a worker large enough to run them. If monitoring watchdog is not enabled, then this heuristic has no effect. (default=0)
+    # - "resource-submit-multiplier" Treat each worker as having ({cores,memory,gpus} * multiplier) when submitting tasks. This allows for tasks to wait at a worker rather than the manager. (default = 1.0)
+    # - "short-timeout" Set the minimum timeout when sending a brief message to a single worker. (default=5s)
+    # - "transfer-outlier-factor" Transfer that are this many times slower than the average will be terminated.  (default=10x)
+    # - "transfer-replica-per-cycle" Number of replicas to schedule per file per iteration. (default=1)
+    # - "transfer-temps-recovery" If 1, try to replicate temp files to reach threshold on worker removal. (default=0)
+    # - "transient-error-interval" Time to wait in seconds after a resource failure before attempting to use it again. (default=15)
+    # - "wait-for-workers" Mimimum number of workers to connect before starting dispatching tasks. (default=0)
+    # - "wait-retrieve-many" If set to 0, cvine.vine_wait breaks out of the while loop whenever a task changes to "task_done" (wait_retrieve_one mode). If set to 1, vine_wait does not break, but continues recieving and dispatching tasks. This occurs until no task is sent or recieved, at which case it breaks out of the while loop (wait_retrieve_many mode). (default=0)
+    # - "worker-retrievals" If 1, retrieve all completed tasks from a worker when retrieving results, even if going above the parameter max-retrievals . Otherwise, if 0, retrieve just one task before deciding to dispatch new tasks or connect new workers. (default=1)
+    # - "watch-library-logfiles" If 1, watch the output files produced by each of the library processes running on the remote workers, take them back the current logging directory. (default=0)
+    # @param value The value to set the parameter to.
+    # @return 0 on succes, -1 on failure.
+    #
+    def tune(self, name, value):
+        return cvine.vine_tune(self._taskvine, name, value)
+
+    ##
+    # Submit a task to the manager.
+    #
+    # It is safe to re-submit a task returned by @ref ndcctools.taskvine.manager.Manager.wait.
+    #
+    # @param self   Reference to the current manager object.
+    # @param task   A task description created from @ref ndcctools.taskvine.task.Task.
+    def submit(self, task):
+        # Tag BEFORE warm conversion: _warm_intercept replaces PythonTask with a
+        # FunctionCall whose _fn_def is (None, (), {}) — meaningless for hashing.
+        # Tagging first captures the real func+args from the original PythonTask.
+        self._audit_tag_task(task)
+        if self._warm_mode:
+            from .warm_manager import _warm_intercept
+            task = _warm_intercept(self, task)
+        if self._metrics_first_submit is None:
+            self._metrics_first_submit = time.perf_counter()
+        if self._replay_mode:
+            _key = getattr(task, '_vine_audit_key', None)
+            if _key:
+                if _key in self._replay_map:
+                    _hostname = self._replay_map[_key].get('hostname', '').split('.')[0]
+                    if _hostname:
+                        task.add_feature(f"env-{_hostname}")
+                else:
+                    # Hash mismatch: args differed between audit and replay
+                    # (e.g. fewer surviving files due to transient failures).
+                    # Routing is undefined — fail fast rather than silently
+                    # sending the task to a random (possibly wrong) worker.
+                    raise ValueError(
+                        f"[vine] replay ERROR: task key {_key!r} not found in "
+                        f"audit map. Audit and replay produced different task "
+                        f"arguments (e.g. different surviving file set). "
+                        f"Re-run the audit under the same data conditions or "
+                        f"fix the upstream data failure before replaying."
+                    )
+        task.manager = self
+        task.submit_finalize()
+        task_id = cvine.vine_submit(self._taskvine, task._task)
+        if task_id == 0:
+            raise ValueError("invalid task description")
+        else:
+            self._task_table[task_id] = task
+            return task_id
+
+    ##
+    # Submit a library to install on all connected workers
+    #
+    #
+    # @param self   Reference to the current manager object.
+    # @param task   A Library Task description created from create_library_from_functions or create_library_from_files
+    def install_library(self, task):
+        if not isinstance(task, LibraryTask):
+            raise TypeError(f"Given task is of type {type(task)}. Please provide a LibraryTask as the task argument.")
+        self._library_table[task.get_libray_provided()] = task
+        cvine.vine_manager_install_library(self._taskvine, task._task, task.get_libray_provided())
+
+    ##
+    # Remove a library from all connected workers
+    #
+    #
+    # @param self   Reference to the current manager object.
+    # @param name   Name of the library to be removed.
+    def remove_library(self, name):
+        del self._library_table[name]
+        cvine.vine_manager_remove_library(self._taskvine, name)
+
+    ##
+    # Check whether a libray exists on the manager or not
+    #
+    # @param self           Reference to the current manager object.
+    # @param library_name   Name of the library to be checked
+    def check_library_exists(self, library_name):
+        if not isinstance(library_name, str):
+            raise TypeError(f"library_name should be str, not {type(library_name)}")
+        return cvine.vine_manager_find_library_template(self._taskvine, library_name) is not None
+
+    ##
+    # Turn a list of python functions into a Library Task.
+    # This Library Task will be run on a worker as a regular task.
+    # Note that functions are required to have source code available,
+    # so dynamically generated functions won't work (e.g., lambda, interactive).
+    #
+    # @param self            Reference to the current manager object.
+    # @param library_name    Name of the Library to be created
+    # @param function_list   List of all functions to be included in the library
+    # @param poncho_env      Name of an already prepared poncho environment or a conda environment
+    # @param init_command    A string describing a shell command to execute before the library task is run
+    # @param add_env         Whether to automatically create and/or add environment to the library
+    # @param hoisting_modules  A list of modules imported at the preamble of library, including packages, functions and classes.
+    # @param exec_mode       Execution mode that the library should use to run function calls. Either 'direct' or 'fork'
+    # @param library_context_info   A list containing [library_context_func, library_context_args, library_context_kwargs]. Used to create the library context on remote nodes.
+    # @returns               A task to be used with @ref ndcctools.taskvine.manager.Manager.install_library.
+    def create_library_from_functions(self, library_name, *function_list, poncho_env=None, init_command=None, add_env=True, hoisting_modules=None, exec_mode='fork', library_context_info=None):
+        # Delay loading of poncho until here, to avoid bringing in poncho dependencies unless needed.
+        # Ensure poncho python library is available.
+        from ndcctools.poncho import package_serverize
+
+        # Check if the library is empty
+        if len(function_list) == 0:
+            raise ValueError('A library cannot have 0 functions.')
+
+        # Check if exec_mode is valid
+        # Currently taskvine only supports 'fork' and 'direct'.
+        if exec_mode != 'fork' and exec_mode != 'direct':
+            raise ValueError(f'A library cannot have exec_mode as {exec_mode}. Only "fork" and "direct" are supported.')
+
+        # Create a unique hash of a library from all information that determine a library's uniqueness.
+        library_hash = package_serverize.generate_library_hash(library_name=library_name,
+                                                               function_list=function_list,
+                                                               poncho_env=poncho_env,
+                                                               init_command=init_command,
+                                                               add_env=add_env,
+                                                               exec_mode=exec_mode,
+                                                               hoisting_modules=hoisting_modules,
+                                                               library_context_info=library_context_info)
+
+        # Create path for caching library code and environment based on function hash.
+        library_cache_dir_name = "vine-library-cache"
+        library_code_name = "library_code.py"
+        library_info_name = "library_info.clpk"
+        library_cache_path = os.path.join(self.cache_directory, library_cache_dir_name, library_hash)
+        library_code_path = os.path.join(library_cache_path, library_code_name)
+        library_info_path = os.path.join(library_cache_path, library_info_name)
+
+        # If library cache directory doesn't exist, create it.
+        pathlib.Path(library_cache_path).mkdir(mode=0o755, parents=True, exist_ok=True)
+
+        # Don't create a custom poncho environment if it's already given.
+        if poncho_env:
+            library_env_path = poncho_env
+            if not os.path.isfile(library_env_path) and add_env is True:
+                # library_env_path must be the name of a conda environment
+                conda_env_name = library_env_path
+                library_env_path = os.path.join(library_cache_path, library_env_path)
+                library_env_path += '.tar.gz'
+                if not os.path.isfile(library_env_path):
+                    from ndcctools.poncho.package_create import pack_env
+                    pack_env(conda_env_name, library_env_path)
+        else:
+            default_poncho_tarball = 'library_env.tar.gz'
+            library_env_path = os.path.join(library_cache_path, default_poncho_tarball)
+
+        # If the library code and environment exist, move on to creating the Library Task.
+        # Else create them in the relevant paths.
+        if not (os.path.isfile(library_code_path) and os.path.isfile(library_env_path)):
+            # Don't create a new poncho environment tarball if one is already provided or
+            # user explicitly tells not to via `add_env` or the poncho tarball already exists.
+            need_pack = True
+            if poncho_env or not add_env or os.path.isfile(library_env_path):
+                need_pack = False
+
+            # create library code
+            # environment is also created if need_pack is True
+            package_serverize.generate_library(library_cache_path=library_cache_path,
+                                               library_code_path=library_code_path,
+                                               library_env_path=library_env_path,
+                                               library_info_path=library_info_path,
+                                               functions=function_list,
+                                               library_name=library_name,
+                                               need_pack=need_pack,
+                                               exec_mode=exec_mode,
+                                               hoisting_modules=hoisting_modules,
+                                               library_context_info=library_context_info)
+
+            # enable correct permissions for library code
+            os.chmod(library_code_path, 0o775)
+
+        # Create Task to execute the Library and prepend it with some setup code if needed.
+        if init_command:
+            t = LibraryTask(f"{init_command} python {library_code_name}", library_name)
+        else:
+            t = LibraryTask(f"python {library_code_name}", library_name)
+
+        # Declare the environment if needed.
+        if add_env:
+            f = self.declare_poncho(library_env_path, cache=True)
+            t.add_environment(f)
+
+        # Declare the library code as an input.
+        f = self.declare_file(library_code_path, cache=True, peer_transfer=True)
+        t.add_input(f, library_code_name)
+        f = self.declare_file(library_info_path, cache=True, peer_transfer=True)
+        t.add_input(f, library_info_name)
+
+        # Register execution mode of functions in this library
+        t.set_function_exec_mode_from_string(exec_mode)
+        return t
+
+    ##
+    # Turn Library code created with poncho_package_serverize into a Library Task
+    #
+    # @param self            Reference to the current manager object.
+    # @param library_name    Name that identifies this library to the FunctionCalls
+    # @param library_path    Filename of the library (i.e., the output of poncho_package_serverize)
+    # @param env             Environment to run the library. Either a vine file
+    #                        that expands to an environment (see @ref ndcctools.taskvine.task.Task.add_environment), or a path
+    #                        to a poncho environment.
+    # @returns               A task to be used with @ref ndcctools.taskvine.manager.Manager.install_library.
+    def create_library_from_serverized_files(self, library_name, library_path, env=None):
+        t = LibraryTask("python ./library_code.py", library_name)
+        if env:
+            if isinstance(env, str):
+                env = self.declare_poncho(env, cache=True)
+                t.add_environment(env)
+            else:
+                t.add_environment(env)
+        f = self.declare_file(library_path, cache=True)
+        t.add_input(f, "library_code.py")
+
+        return t
+
+    ##
+    # Create a Library task from arbitrary inputs
+    #
+    # @param self            Reference to the current manager object
+    # @param executable_path Filename of the library executable
+    # @param name            Name of the library to be created
+    # @param env             Environment to run the library. Either a vine file
+    #                        that expands to an environment (see @ref ndcctools.taskvine.task.Task.add_environment), or a path
+    #                        to a poncho environment.
+    # @returns               A task to be used with @ref ndcctools.taskvine.manager.Manager.install_library
+    def create_library_from_command(self, executable_path, name, env=None):
+        t = LibraryTask("./library_exe", name)
+        f = self.declare_file(executable_path, cache=True)
+        t.add_input(f, "library_exe")
+        if env:
+            if isinstance(env, str):
+                env = self.declare_poncho(env, cache=True)
+                t.add_environment(env)
+            else:
+                t.add_environment(env)
+        return t
+
+    ##
+    # Wait for tasks to complete.
+    #
+    # This call will block until the timeout has elapsed
+    #
+    # @param self       Reference to the current manager object.
+    # @param timeout    The number of seconds to wait for a completed task
+    #                   before returning.  Use an integer to set the timeout or the value
+    #                   "wait_forever" to block until a task has completed.
+    #                   If 0, return immediately with a complete task if one available, or None otherwise.
+    def wait(self, timeout="wait_forever"):
+        if timeout == "wait_forever":
+            timeout = get_c_constant("wait_forever")
+        return self.wait_for_tag(None, timeout)
+
+    ##
+    # Similar to @ref ndcctools.taskvine.manager.Manager.wait, but guarantees that the returned task has the
+    # specified tag.
+    #
+    # This call will block until the timeout has elapsed.
+    #
+    # @param self       Reference to the current manager object.
+    # @param tag        Desired tag. If None, then it is equivalent to self.wait(timeout)
+    # @param timeout    The number of seconds to wait for a completed task
+    #                   before returning.
+    #                   If 0, return immediately with a complete task if one available, or None otherwise.
+    # ── Audit helpers ─────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _audit_hash_func(func):
+        """Return a sha256 hasher seeded with stable function identity (bytecode-based)."""
+        h = hashlib.sha256()
+        h.update(getattr(func, '__qualname__', '').encode())
+        h.update(b'@')
+        h.update(getattr(func, '__module__', '').encode())
+        code = getattr(func, '__code__', None)
+        if code:
+            co = code.co_code if isinstance(code.co_code, bytes) else code.co_code.tobytes()
+            h.update(co)
+            # Recursively hash nested code objects (listcomps, lambdas) by bytecode only.
+            def _hash_consts(consts):
+                for c in consts:
+                    if hasattr(c, 'co_code'):
+                        inner = c.co_code if isinstance(c.co_code, bytes) else c.co_code.tobytes()
+                        h.update(inner)
+                        _hash_consts(c.co_consts)
+                    elif isinstance(c, (str, int, float, bytes, bool, type(None))):
+                        h.update(repr(c).encode())
+            _hash_consts(code.co_consts)
+        return h
+
+    @staticmethod
+    def _audit_hash_primitive(h, value):
+        """Hash a primitive value into h. Lists/tuples are recursed; others by repr.
+
+        String lists are sorted before hashing: task identity depends on WHICH
+        files are in the argument, not the order they were appended (which varies
+        with task completion timing and breaks cross-run key stability).
+        """
+        if isinstance(value, (list, tuple)):
+            # Sort homogeneous string lists so completion-order variance doesn't
+            # change the audit key (e.g. valid_anomaly_files built by append-on-done).
+            items = value
+            if items and all(isinstance(i, str) for i in items):
+                items = sorted(items)
+            for item in items:
+                Manager._audit_hash_primitive(h, item)
+        elif isinstance(value, dict):
+            for k in sorted(value.keys(), key=str):
+                Manager._audit_hash_primitive(h, k)
+                Manager._audit_hash_primitive(h, value[k])
+        elif isinstance(value, (str, int, float, bool, bytes, type(None))):
+            h.update(repr(value).encode())
+
+    @staticmethod
+    def _normalize_for_hash(obj):
+        """Recursively normalize a task sexpr into a deterministic, hashable structure.
+
+        Strips run-varying tokens (UUIDs, PIDs), represents callables by stable
+        identity (qualname + module + bytecode), and sorts dict keys so that
+        insertion-order variance (e.g. from os.listdir) does not affect the hash.
+
+        Used by DaskVine._audit_tag_task; exposed here so other Manager subclasses
+        can reuse it.
+        """
+        if isinstance(obj, str):
+            # Dask internal temporary names
+            obj = re.sub(r"(zip|subgraph_callable)-[0-9a-f]+", r"\1-<TOKEN>", obj)
+            # TaskVine temporary file handles: w_uuid / f_uuid / a_uuid / o_uuid
+            obj = re.sub(r"\b([wfao])_[0-9a-f-]{8,}\b", r"\1_<TOKEN>", obj)
+            # Manager names with PIDs
+            obj = re.sub(r"goes-tv-\d+", "goes-tv-<PID>", obj)
+            return obj
+
+        elif isinstance(obj, tuple):
+            # Normalize zip-task keys: ('zip-<hash>', index) → deterministic sentinel
+            if (
+                len(obj) == 2
+                and isinstance(obj[0], str)
+                and obj[0].startswith("zip-")
+                and isinstance(obj[1], int)
+            ):
+                return ("zip-<TOKEN>", "<INDEX>")
+            return tuple(Manager._normalize_for_hash(x) for x in obj)
+
+        elif isinstance(obj, list):
+            return [Manager._normalize_for_hash(x) for x in obj]
+
+        elif isinstance(obj, dict):
+            # Sort by str(key) so os.listdir ordering doesn't affect hash
+            return {
+                Manager._normalize_for_hash(k): Manager._normalize_for_hash(v)
+                for k, v in sorted(obj.items(), key=lambda x: str(x[0]))
+            }
+
+        elif callable(obj):
+            # Represent callable by stable identity, not object id
+            return {
+                "name": getattr(obj, "__name__", ""),
+                "module": getattr(obj, "__module__", ""),
+                "bytecode": obj.__code__.co_code.hex() if hasattr(obj, "__code__") else None,
+            }
+
+        else:
+            return obj
+
+    def _audit_tag_task(self, task):
+        """
+        Compute and assign a stable audit key to a raw PythonTask before submit.
+
+        Only handles tasks whose _fn_def args are all primitive values (str, int,
+        float, bytes, bool, None, or flat lists/dicts thereof).  Tasks with graph
+        references in args (e.g. Dask UUID keys) must be handled by a subclass
+        override — see DaskVine._audit_tag_task().
+
+        Key stored on task._vine_audit_key (Python attr) separate from C-level tag.
+        """
+        if not (self._audit_mode or self._replay_mode) or hasattr(task, '_vine_audit_key'):
+            return
+        fn_def = getattr(task, '_fn_def', None)
+        if fn_def is None:
+            return
+        func, args, kwargs = fn_def
+
+        # ── old approach (kept for reference) ─────────────────────────────────
+        # h = self._audit_hash_func(func)           # hashes execute_graph_vertex bytecode
+        # for arg in args:                           # includes raw dask task key string —
+        #     self._audit_hash_primitive(h, arg)     # both are unstable for DaskVine tasks
+        # for k in sorted(kwargs.keys()):
+        #     self._audit_hash_primitive(h, k)
+        #     self._audit_hash_primitive(h, kwargs[k])
+        # name = getattr(func, '__qualname__', 'task')
+        # task._vine_audit_key = f"{name}-{h.hexdigest()[:32]}"
+        # ── end old approach ───────────────────────────────────────────────────
+
+        normalized = self._normalize_for_hash({
+            'func': func,
+            'args': list(args),
+            'kwargs': dict(sorted(kwargs.items(), key=lambda x: str(x[0]))),
+        })
+        payload = cloudpickle.dumps(normalized)
+        digest = hashlib.sha256(payload).hexdigest()[:32]
+        name = getattr(func, '__qualname__', 'task')
+        task._vine_audit_key = f"{name}-{digest}"
+
+    def _audit_record(self, task):
+        """Record stable key → worker entry; flushed at process exit via atexit."""
+        stable_key = getattr(task, '_vine_audit_key', None)
+        if not stable_key:
+            return
+        self._audit_map[stable_key] = {
+            "hostname": task.hostname,
+            "addrport": task.addrport,
+        }
+
+    def _audit_flush(self):
+        """Flush audit map to disk at exit. Direct write (no atomic rename) so
+        libptu's open() hook captures the final path and bakes it into the SIF."""
+        parent = os.path.dirname(self._audit_output)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(self._audit_output, 'w') as f:
+            json.dump(self._audit_map, f, indent=2)
+
+    # ── Metrics ───────────────────────────────────────────────────────────────
+
+    def _record_task_metrics(self, task):
+        """Record timing metrics for a task returned by any wait variant."""
+        self._metrics_last_result = time.perf_counter()
+        exec_us = task.get_metric('time_workers_execute_last')
+        if exec_us and exec_us > 0:
+            self._metrics_task_exec_us.append(exec_us)
+        if self._audit_mode:
+            self._audit_record(task)
+
+    def workflow_summary(self, reset=False, verbose=False):
+        """
+        Return workflow timing metrics and print a formatted summary.
+
+        Metrics are collected automatically as the application runs:
+          - Workflow time : wall time from first submit() to last wait() result.
+          - Task exec time: time_workers_execute_last reported by each worker
+                            (pure execution, excluding transfer and scheduling).
+
+        Call this at the end of your application:
+            m.workflow_summary()
+
+        Returns
+        -------
+        dict with keys:
+          workflow_time_s    : total workflow wall time (seconds)
+          n_tasks            : number of tasks with recorded execution time
+          avg_task_exec_s    : mean worker execution time (seconds)
+          min_task_exec_s    : minimum worker execution time (seconds)
+          max_task_exec_s    : maximum worker execution time (seconds)
+          throughput_tasks_s : tasks per second  (n_tasks / workflow_time_s)
+        Returns an empty dict if no tasks have completed yet.
+        """
+        if self._metrics_first_submit is None or self._metrics_last_result is None:
+            print("[workflow_summary] No tasks have completed yet.")
+            return {}
+
+        workflow_time = self._metrics_last_result - self._metrics_first_submit
+        n = len(self._metrics_task_exec_us)
+
+        metrics = {'workflow_time_s': workflow_time, 'n_tasks': n}
+
+        if n > 0:
+            exec_s = [us / 1e6 for us in self._metrics_task_exec_us]
+            metrics['task_exec_s']        = exec_s
+            metrics['avg_task_exec_s']    = sum(exec_s) / n
+            metrics['min_task_exec_s']    = min(exec_s)
+            metrics['max_task_exec_s']    = max(exec_s)
+            metrics['throughput_tasks_s'] = n / workflow_time if workflow_time > 0 else 0.0
+
+        bar = '─' * 52
+        print(f"\n{bar}")
+        print(f"  Workflow summary")
+        print(f"{bar}")
+        print(f"  Workflow time      : {workflow_time:.3f} s")
+        print(f"  Tasks completed    : {n}")
+        if n > 0:
+            print(f"  Avg task exec      : {metrics['avg_task_exec_s']:.3f} s")
+            print(f"  Min task exec      : {metrics['min_task_exec_s']:.3f} s")
+            print(f"  Max task exec      : {metrics['max_task_exec_s']:.3f} s")
+            print(f"  Throughput         : {metrics['throughput_tasks_s']:.2f} tasks/s")
+            if verbose:
+                exec_s = metrics.get('task_exec_s', [us / 1e6 for us in self._metrics_task_exec_us])
+                print(f"  Task exec times (s): {[round(t, 3) for t in exec_s]}")
+        print(f"{bar}\n")
+
+        if reset:
+            self._metrics_first_submit = None
+            self._metrics_last_result  = None
+            self._metrics_task_exec_us = []
+
+        return metrics
+
+    def wait_for_tag(self, tag, timeout="wait_forever"):
+        if timeout == "wait_forever":
+            timeout = get_c_constant("wait_forever")
+
+        self._update_status_display()
+
+        task_pointer = cvine.vine_wait_for_tag(self._taskvine, tag, timeout)
+        if task_pointer:
+            if self.empty():
+                # if last task in queue, update display
+                self._update_status_display(force=True)
+            task = self._task_table[cvine.vine_task_get_id(task_pointer)]
+            del self._task_table[cvine.vine_task_get_id(task_pointer)]
+            self._record_task_metrics(task)
+            return task
+        return None
+
+    ##
+    # Similar to @ref ndcctools.taskvine.manager.Manager.wait, but guarantees that the returned task has the
+    # specified task_id.
+    #
+    # This call will block until the timeout has elapsed.
+    #
+    # @param self       Reference to the current manager object.
+    # @param task_id    Desired task_id. If -1, then it is equivalent to self.wait(timeout)
+    # @param timeout    The number of seconds to wait for a completed task
+    #                   before returning. If 0, return immediately with a complete task if one available,
+    #                   or None otherwise.
+    def wait_for_task_id(self, task_id, timeout="wait_forever"):
+        if timeout == "wait_forever":
+            timeout = get_c_constant("wait_forever")
+
+        task_pointer = cvine.vine_wait_for_task_id(self._taskvine, task_id, timeout)
+        if task_pointer:
+            task = self._task_table[cvine.vine_task_get_id(task_pointer)]
+            del self._task_table[cvine.vine_task_get_id(task_pointer)]
+            self._record_task_metrics(task)
+            return task
+        return None
+
+    ##
+    # Should return a dictionary with information for the status display.
+    # This method is meant to be overriden by custom applications.
+    #
+    # The dictionary should be of the form:
+    #
+    # { "application_info" : {"values" : dict, "units" : dict} }
+    #
+    # where "units" is an optional dictionary that indicates the units of the
+    # corresponding key in "values".
+    #
+    # @param self       Reference to the current work queue object.
+    #
+    # For example:
+    # @code
+    # >>> myapp.application_info()
+    # {'application_info': {'values': {'size_max_output': 0.361962, 'current_chunksize': 65536}, 'units': {'size_max_output': 'MB'}}}
+    # @endcode
+    def application_info(self):
+        return None
+
+    ##
+    # Maps a function to elements in a sequence using taskvine
+    #
+    # Similar to regular map function in python
+    #
+    # @param self       Reference to the current manager object.
+    # @param fn         The function that will be called on each element
+    # @param seq        The sequence that will call the function
+    # @param chunksize  The number of elements to process at once
+
+    def map(self, fn, seq, chunksize=1):
+        size = math.ceil(len(seq) / chunksize)
+        results = [None] * size
+        tasks = {}
+
+        for i in range(size):
+            start = i * chunksize
+            end = start + chunksize
+
+            if end > len(seq):
+                p_task = PythonTask(map, fn, seq[start:])
+            else:
+                p_task = PythonTask(map, fn, seq[start:end])
+
+            p_task.set_tag(str(i))
+            self.submit(p_task)
+            tasks[p_task.id] = i
+
+        n = 0
+        for i in range(size + 1):
+            while not self.empty() and n < size:
+                for key, value in tasks.items():
+                    if value == i:
+                        t_id = key
+                        break
+                t = self.wait_for_task_id(t_id, 1)
+                if t:
+                    results[tasks[t.id]] = list(t.output)
+                    n += 1
+                    break
+
+        results = [elem if isinstance(elem, list) else [elem] for elem in results]
+
+        return [item for elem in results for item in elem]
+
+    ##
+    # Returns the values for a function of each pair from 2 sequences
+    #
+    # The pairs that are passed into the function are generated by itertools
+    #
+    # @param self     Reference to the current manager object.
+    # @param fn       The function that will be called on each element
+    # @param seq1     The first seq that will be used to generate pairs
+    # @param seq2     The second seq that will be used to generate pairs
+    # @param chunksize  Number of pairs to process at once (default is 1)
+    # @param env      Filename of a python environment tarball (conda or poncho)
+    def pair(self, fn, seq1, seq2, chunksize=1, env=None):
+        def fpairs(fn, s):
+            results = []
+
+            for p in s:
+                results.append(fn(p))
+
+            return results
+
+        size = math.ceil((len(seq1) * len(seq2)) / chunksize)
+        results = [None] * size
+        tasks = {}
+        task = []
+        num = 0
+        num_task = 0
+
+        for item in itertools.product(seq1, seq2):
+            if num == chunksize:
+                p_task = PythonTask(fpairs, fn, task)
+                if env:
+                    p_task.add_environment(env)
+
+                p_task.set_tag(str(num_task))
+                self.submit(p_task)
+                tasks[p_task.id] = num_task
+                num = 0
+                num_task += 1
+                task.clear()
+
+            task.append(item)
+            num += 1
+
+        if len(task) > 0:
+            p_task = PythonTask(fpairs, fn, task)
+            p_task.set_tag(str(num_task))
+            self.submit(p_task)
+            tasks[p_task.id] = num_task
+            num_task += 1
+
+        n = 0
+        for i in range(num_task):
+            while not self.empty() and n < num_task:
+                for key, value in tasks.items():
+                    if value == i:
+                        t_id = key
+                        break
+                t = self.wait_for_task_id(t_id, 10)
+
+                if t:
+                    results[tasks[t.id]] = t.output
+                    n += 1
+                    break
+
+        results = [elem if isinstance(elem, list) else [elem] for elem in results]
+
+        return [item for elem in results for item in elem]
+
+    ##
+    # Reduces a sequence until only one value is left, and then returns that value.
+    # The sequence is reduced by passing a pair of elements into a function and
+    # then stores the result. It then makes a sequence from the results, and
+    # reduces again until one value is left.
+    #
+    # If the sequence has an odd length, the last element gets reduced at the
+    # end.
+    #
+    # @param self       Reference to the current manager object.
+    # @param fn         The function that will be called on each element
+    # @param seq        The seq that will be reduced
+    # @param chunksize The number of elements per Task (for tree reduc, must be greater than 1)
+    def tree_reduce(self, fn, seq, chunksize=2):
+        tasks = {}
+        num_task = 0
+
+        while len(seq) > 1:
+            size = math.ceil(len(seq) / chunksize)
+            results = [None] * size
+
+            for i in range(size):
+                start = i * chunksize
+                end = start + chunksize
+
+                if end > len(seq):
+                    p_task = PythonTask(fn, seq[start:])
+                else:
+                    p_task = PythonTask(fn, seq[start:end])
+
+                p_task.set_tag(str(i))
+                self.submit(p_task)
+                tasks[p_task.id] = num_task
+                num_task += 1
+
+            n = 0
+            for i in range(size + 1):
+                while not self.empty() and n < size:
+                    for key, value in tasks.items():
+                        if value == num_task - size + i:
+                            t_id = key
+                            break
+                    t = self.wait_for_task_id(t_id, 10)
+
+                    if t:
+                        results[i] = t.output
+                        n += 1
+                        break
+
+            seq = results
+
+        return seq[0]
+
+    ##
+    # Maps a function to elements in a sequence using taskvine remote task
+    #
+    # Similar to regular map function in python, but creates a task to execute each function on a worker running a library
+    #
+    # @param self       Reference to the current manager object.
+    # @param fn         The function that will be called on each element. This function exists in library.
+    # @param seq        The sequence that will call the function
+    # @param library  The name of the library that contains the function fn.
+    # @param name       This defines the key in the event json that wraps the data sent to the library.
+    # @param chunksize The number of elements to process at once
+    def remote_map(self, fn, seq, library, name, chunksize=1):
+        size = math.ceil(len(seq) / chunksize)
+        results = [None] * size
+        tasks = {}
+
+        for i in range(size):
+            start = i * chunksize
+            end = min(len(seq), start + chunksize)
+
+            event = json.dumps({name: seq[start:end]})
+            p_task = FunctionCall(fn, event, library)
+
+            p_task.set_tag(str(i))
+            self.submit(p_task)
+            tasks[p_task.id] = i
+
+        n = 0
+        for i in range(size + 1):
+            while not self.empty() and n < size:
+                for key, value in tasks.items():
+                    if value == i:
+                        t_id = key
+                        break
+                t = self.wait_for_task_id(t_id, 1)
+                if t:
+                    results[tasks[t.id]] = list(json.loads(t.output)["Result"])
+                    n += 1
+                    break
+
+        results = [elem if isinstance(elem, list) else [elem] for elem in results]
+
+        return [item for elem in results for item in elem]
+
+    ##
+    # Returns the values for a function of each pair from 2 sequences using remote task
+    #
+    # The pairs that are passed into the function are generated by itertools
+    #
+    # @param self     Reference to the current manager object.
+    # @param fn       The function that will be called on each element. This function exists in library.
+    # @param seq1     The first seq that will be used to generate pairs
+    # @param seq2     The second seq that will be used to generate pairs
+    # @param library  The name of the library that contains the function fn.
+    # @param name       This defines the key in the event json that wraps the data sent to the library.
+    # @param chunksize The number of elements to process at once
+    def remote_pair(self, fn, seq1, seq2, library, name, chunksize=1):
+        size = math.ceil((len(seq1) * len(seq2)) / chunksize)
+        results = [None] * size
+        tasks = {}
+        task = []
+        num = 0
+        num_task = 0
+
+        for item in itertools.product(seq1, seq2):
+            if num == chunksize:
+                event = json.dumps({name: task})
+                p_task = FunctionCall(fn, event, library)
+                p_task.set_tag(str(num_task))
+                self.submit(p_task)
+                tasks[p_task.id] = num_task
+                num = 0
+                num_task += 1
+                task.clear()
+
+            task.append(item)
+            num += 1
+
+        if len(task) > 0:
+            event = json.dumps({name: task})
+            p_task = FunctionCall(fn, event, library)
+            p_task.set_tag(str(num_task))
+            self.submit(p_task)
+            tasks[p_task.id] = num_task
+            num_task += 1
+
+        n = 0
+        for i in range(num_task):
+            while not self.empty() and n < num_task:
+                for key, value in tasks.items():
+                    if value == i:
+                        t_id = key
+                        break
+                t = self.wait_for_task_id(t_id, 1)
+                if t:
+                    results[tasks[t.id]] = json.loads(t.output)["Result"]
+                    n += 1
+                    break
+
+        results = [elem if isinstance(elem, list) else [elem] for elem in results]
+
+        return [item for elem in results for item in elem]
+
+    ##
+    # Reduces a sequence until only one value is left, and then returns that value.
+    # The sequence is reduced by passing a pair of elements into a function and
+    # then stores the result. It then makes a sequence from the results, and
+    # reduces again until one value is left. Executes on library
+    #
+    # If the sequence has an odd length, the last element gets reduced at the
+    # end.
+    #
+    # @param self       Reference to the current manager object.
+    # @param fn         The function that will be called on each element. Exists on the library
+    # @param seq        The seq that will be reduced
+    # @param library  The name of the library that contains the function fn.
+    # @param name       This defines the key in the event json that wraps the data sent to the library.
+    # @param chunksize The number of elements per Task (for tree reduc, must be greater than 1)
+    def remote_tree_reduce(self, fn, seq, library, name, chunksize=2):
+        tasks = {}
+        num_task = 0
+
+        while len(seq) > 1:
+            size = math.ceil(len(seq) / chunksize)
+            results = [None] * size
+
+            for i in range(size):
+                start = i * chunksize
+                end = min(len(seq), start + chunksize)
+
+                event = json.dumps({name: seq[start:end]})
+                p_task = FunctionCall(fn, event, library)
+
+                p_task.set_tag(str(i))
+                self.submit(p_task)
+                tasks[p_task.id] = num_task
+                num_task += 1
+
+            n = 0
+            for i in range(size + 1):
+                while not self.empty() and n < size:
+                    for key, value in tasks.items():
+                        if value == num_task - size + i:
+                            t_id = key
+                            break
+                    t = self.wait_for_task_id(t_id, 10)
+
+                    if t:
+                        results[i] = json.loads(t.output)["Result"]
+                        n += 1
+                        break
+
+            seq = results
+
+        return seq[0]
+
+    ##
+    # Declare a file obtained from the local filesystem.
+    #
+    # @param self    The manager to register this file
+    # @param path    The path to the local file
+    # @param cache   If True or 'workflow', cache the file at workers for reuse
+    #                until the end of the workflow. If 'worker', the file is cache until the
+    #                end-of-life of the worker. If 'forever', the file is cached beyond the end-of-life of the worker. Default is False (file is not cached).
+    # @param peer_transfer   Whether the file can be transfered between workers when
+    #                peer transfers are enabled (see @ref ndcctools.taskvine.manager.Manager.enable_peer_transfers). Default is True.
+    # @param unlink_when_done   Whether to delete the file when its reference count is 0. (Warning: Only use on files produced by the application, and never on irreplaceable input files.)
+    # @return
+    # A file object to use in @ref ndcctools.taskvine.task.Task.add_input or @ref ndcctools.taskvine.task.Task.add_output
+    def declare_file(self, path, cache=False, peer_transfer=True, unlink_when_done=False):
+        flags = Task._determine_file_flags(peer_transfer, unlink_when_done)
+        cache_level = Task._determine_cache_level(cache)
+        f = cvine.vine_declare_file(self._taskvine, path, cache_level, flags)
+        return File(f)
+
+    ##
+    # Fetch file contents from the cluster or local disk.
+    #
+    # @param self    The manager to register this file
+    # @param file    The file object
+    # @return The contents of the file as a strong.
+    def fetch_file(self, file):
+        return cvine.vine_fetch_file(self._taskvine, file._file)
+
+    ##
+    # Un-declare a file that was created by @ref declare_file or similar methods.
+    # The given file or directory object is deleted from all worker's caches,
+    # and is no longer available for use as an input file.
+    # Completed tasks waiting for retrieval are not affected.
+    # Note that all declared files are automatically undeclared by @ref vine_delete,
+    # however this function can be used for earlier cleanup of unneeded file objects.
+    #
+    # @param self    The manager to register this file
+    # @param file    The file object
+    def undeclare_file(self, file):
+        cvine.vine_undeclare_file(self._taskvine, file._file)
+
+    def prune_file(self, file):
+        cvine.vine_prune_file(self._taskvine, file._file)
+
+    # Deprecated, for backwards compatibility.
+    def remove_file(self, file):
+        self.undeclare_file(file)
+
+    ##
+    # Remove the manager's local serialized copy of a function used with PythonTask.
+    #
+    # @param self    The manager to register this file
+    # @param fn      The function that the manager should forget.
+    def undeclare_function(self, fn):
+        try:
+            b = self._function_buffers.pop(fn, None)
+            self.remove_file(b)
+        except KeyError:
+            pass
+
+    ##
+    # Declare an anonymous file has no initial content, but is created as the
+    # output of a task, and may be consumed by other tasks.
+    #
+    # @param self    The manager to register this file
+    # @return A file object to use in @ref ndcctools.taskvine.task.Task.add_input or @ref ndcctools.taskvine.task.Task.add_output
+    def declare_temp(self):
+        f = cvine.vine_declare_temp(self._taskvine)
+        return File(f)
+
+    ##
+    # Declare a file obtained from a remote URL.
+    #
+    # @param self    The manager to register this file
+    # @param url     The url of the file.
+    # @param cache   If True or 'workflow', cache the file at workers for reuse
+    #                until the end of the workflow. If 'worker', the file is cache until the
+    #                end-of-life of the worker. If 'forever', the file is cached beyond the end-of-life of the worker. Default is False (file is not cached).
+    # @param peer_transfer   Whether the file can be transfered between workers when
+    #                peer transfers are enabled (see @ref ndcctools.taskvine.manager.Manager.enable_peer_transfers). Default is True.
+    # @return A file object to use in @ref ndcctools.taskvine.task.Task.add_input
+    def declare_url(self, url, cache=False, peer_transfer=True):
+        flags = Task._determine_file_flags(peer_transfer)
+        cache_level = Task._determine_cache_level(cache)
+
+        if not isinstance(url, str):
+            raise TypeError(f"url {url} is not a str")
+
+        f = cvine.vine_declare_url(self._taskvine, url, cache_level, flags)
+        return File(f)
+
+    ##
+    # Declare a file created from a buffer in memory.
+    #
+    # @param self    The manager to register this file
+    # @param buffer  The contents of the buffer, or None for an empty output buffer
+    # @param cache   If True or 'workflow', cache the file at workers for reuse
+    #                until the end of the workflow. If 'worker', the file is cache until the
+    #                end-of-life of the worker. If 'forever', the file is cached beyond the end-of-life of the worker. Default is False (file is not cached).
+    # @param peer_transfer   Whether the file can be transfered between workers when
+    #                peer transfers are enabled (see @ref ndcctools.taskvine.manager.Manager.enable_peer_transfers). Default is True.
+    # @return A file object to use in @ref ndcctools.taskvine.task.Task.add_input
+    #
+    # For example:
+    # @code
+    # >>> s = "hello pirate ♆"
+    # >>> f = m.declare_buffer(bytes(s, "utf-8"))
+    # >>> print(bytes.decode(f.contents(), "utf-8"))
+    # >>> "hello pirate ♆"
+    # @endcode
+    def declare_buffer(self, buffer=None, cache=False, peer_transfer=True):
+        # because of the swig typemap, vine_declare_buffer(m, buffer, size) is changed
+        # to a function with just two arguments.
+        flags = Task._determine_file_flags(cache, peer_transfer)
+        cache_level = Task._determine_cache_level(cache)
+        if isinstance(buffer, str):
+            buffer = bytes(buffer, "utf-8")
+        f = cvine.vine_declare_buffer(self._taskvine, buffer, cache_level, flags)
+        return File(f)
+
+    ##
+    # Declare a file created by executing a mini-task.
+    #
+    # @param self     The manager to register this file
+    # @param minitask The task to execute in order to produce a file
+    # @param source   The name of the file to extract from the task's sandbox.
+    # @param cache   If True or 'workflow', cache the file at workers for reuse
+    #                until the end of the workflow. If 'worker', the file is cache until the
+    #                end-of-life of the worker. If 'forever', the file is cached beyond the end-of-life of the worker. Default is False (file is not cached).
+    # @param peer_transfer   Whether the file can be transfered between workers when
+    #                peer transfers are enabled (see @ref ndcctools.taskvine.manager.Manager.enable_peer_transfers). Default is True.
+    # @return A file object to use in @ref ndcctools.taskvine.task.Task.add_input
+    def declare_minitask(self, minitask, source, cache=False, peer_transfer=True):
+
+        # Attaching a task as a mini-task is like submitting it, so we must finalize the details.
+        minitask.manager = self
+        minitask.submit_finalize()
+
+        # Then proceed to attach the task to the mini-task file object.
+        flags = Task._determine_file_flags(cache, peer_transfer)
+        cache_level = Task._determine_cache_level(cache)
+        f = cvine.vine_declare_mini_task(self._taskvine, minitask._task, source, cache_level, flags)
+
+        # minitasks are freed when the manager frees its related file structure
+        minitask._manager_will_free = True
+
+        return File(f)
+
+    ##
+    # Declare a file created by by unpacking a tar file.
+    #
+    # @param self      The manager to register this file
+    # @param tarball    The file object to un-tar
+    # @param cache   If True or 'workflow', cache the file at workers for reuse
+    #                until the end of the workflow. If 'worker', the file is cache until the
+    #                end-of-life of the worker. If 'forever', the file is cached beyond the end-of-life of the worker. Default is False (file is not cached).
+    # @param peer_transfer   Whether the file can be transfered between workers when
+    #                peer transfers are enabled (see @ref ndcctools.taskvine.manager.Manager.enable_peer_transfers). Default is True.
+    # @return A file object to use in @ref ndcctools.taskvine.task.Task.add_input
+    def declare_untar(self, tarball, cache=False, peer_transfer=True):
+        flags = Task._determine_file_flags(cache, peer_transfer)
+        cache_level = Task._determine_cache_level(cache)
+        f = cvine.vine_declare_untar(self._taskvine, tarball._file, cache_level, flags)
+        return File(f)
+
+    ##
+    # Declare a file that sets up a poncho environment
+    #
+    # @param self    The manager to register this file
+    # @param package The poncho environment tarball. Either a vine file or a
+    #                string representing a local file.
+    # @param cache   If True or 'workflow', cache the file at workers for reuse
+    #                until the end of the workflow. If 'worker', the file is cache until the
+    #                end-of-life of the worker. If 'forever', the file is cached beyond the end-of-life of the worker. Default is False (file is not cached).
+    # @param peer_transfer   Whether the file can be transfered between workers when
+    #                peer transfers are enabled (see @ref ndcctools.taskvine.manager.Manager.enable_peer_transfers). Default is True.
+    # @return A file object to use in @ref ndcctools.taskvine.task.Task.add_input
+    def declare_poncho(self, package, cache=False, peer_transfer=True):
+        if isinstance(package, str):
+            package = self.declare_file(package, cache=True)
+
+        flags = Task._determine_file_flags(cache, peer_transfer)
+        cache_level = Task._determine_cache_level(cache)
+        f = cvine.vine_declare_poncho(self._taskvine, package._file, cache_level, flags)
+        return File(f)
+
+    ##
+    # Declare a file create a file by unpacking a starch package.
+    #
+    # @param self    The manager to register this file
+    # @param starch  The startch .sfx file. Either a vine file or a string
+    #                representing a local file.
+    # @param cache   If True or 'workflow', cache the file at workers for reuse
+    #                until the end of the workflow. If 'worker', the file is cache until the
+    #                end-of-life of the worker. If 'forever', the file is cached beyond the end-of-life of the worker. Default is False (file is not cached).
+    # @param peer_transfer   Whether the file can be transfered between workers when
+    #                peer transfers are enabled (see @ref ndcctools.taskvine.manager.Manager.enable_peer_transfers). Default is True.
+    # @return A file object to use in @ref ndcctools.taskvine.task.Task.add_input
+    def declare_starch(self, starch, cache=False, peer_transfer=True):
+        if isinstance(starch, str):
+            starch = self.declare_file(starch, cache=True)
+
+        flags = Task._determine_file_flags(cache, peer_transfer)
+        cache_level = Task._determine_cache_level(cache)
+        f = cvine.vine_declare_starch(self._taskvine, starch._file, cache_level, flags)
+        return File(f)
+
+    ##
+    # Declare a file from accessible from an xrootd server.
+    #
+    # @param self   The manager to register this file.
+    # @param source The URL address of the root file in text form as: "root://XROOTSERVER[:port]//path/to/file"
+    # @param proxy  A @ref ndcctools.taskvine.file.File of the X509 proxy to use. If None, the
+    #               environment variable X509_USER_PROXY and the file
+    #               "$TMPDIR/$UID" are considered in that order. If no proxy is
+    #               present, the transfer is tried without authentication.
+    # @param env    If not None, an environment file (e.g poncho or starch, see ndcctools.taskvine.task.Task.add_environment)
+    #               that contains the xrootd executables. Otherwise assume xrootd is available
+    #               at the worker.
+    # @param cache   If True or 'workflow', cache the file at workers for reuse
+    #                until the end of the workflow. If 'worker', the file is cache until the
+    #                end-of-life of the worker. If 'forever', the file is cached beyond the end-of-life of the worker. Default is False (file is not cached).
+    # @param peer_transfer   Whether the file can be transfered between workers when
+    #                peer transfers are enabled (see @ref ndcctools.taskvine.manager.Manager.enable_peer_transfers). Default is True.
+    # @return A file object to use in @ref ndcctools.taskvine.task.Task.add_input
+    def declare_xrootd(self, source, proxy=None, env=None, cache=False, peer_transfer=True):
+        proxy_c = None
+        if proxy:
+            proxy_c = proxy._file
+
+        env_c = None
+        if env:
+            env_c = env._file
+
+        flags = Task._determine_file_flags(cache, peer_transfer)
+        cache_level = Task._determine_cache_level(cache)
+        f = cvine.vine_declare_xrootd(self._taskvine, source, proxy_c, env_c, cache_level, flags)
+        return File(f)
+
+    ##
+    # Declare a file from accessible from an xrootd server.
+    #
+    # @param self   The manager to register this file.
+    # @param server The chirp server address of the form "hostname[:port"]"
+    # @param source The name of the file in the server
+    # @param ticket If not None, a file object that provides a chirp an authentication ticket
+    # @param env    If not None, an environment file (e.g poncho or starch)
+    #               that contains the chirp executables. Otherwise assume chirp is available
+    #               at the worker.
+    # @param cache   If True or 'workflow', cache the file at workers for reuse
+    #                until the end of the workflow. If 'worker', the file is cache until the
+    #                end-of-life of the worker. If 'forever', the file is cached beyond the end-of-life of the worker. Default is False (file is not cached).
+    # @param peer_transfer   Whether the file can be transfered between workers when
+    #                peer transfers are enabled (see @ref ndcctools.taskvine.manager.Manager.enable_peer_transfers). Default is True.
+    # @return A file object to use in @ref ndcctools.taskvine.task.Task.add_input
+    def declare_chirp(self, server, source, ticket=None, env=None, cache=False, peer_transfer=True):
+        ticket_c = None
+        if ticket:
+            ticket_c = ticket._file
+
+        env_c = None
+        if env:
+            env_c = env._file
+
+        flags = Task._determine_file_flags(cache, peer_transfer)
+        cache_level = Task._determine_cache_level(cache)
+        f = cvine.vine_declare_chirp(self._taskvine, server, source, ticket_c, env_c, cache_level, flags)
+        return File(f)
+
+    ##
+    # Adds a custom APPLICATION entry to the transactions log.
+    #
+    # @param self The manager to register this file.
+    # @param entry A custom transaction message
+    def log_txn_app(self, entry):
+        cvine.vine_log_txn_app(self._taskvine, entry)
+
+    ##
+    # Adds a custom APPLICATION entry to the debug log.
+    #
+    # @param self   The manager to register this file.
+    # @param entry A custom debug message
+    def log_debug_app(self, entry):
+        cvine.vine_log_debug_app(self._taskvine, entry)
+
+    ##
+    # Gets the number of replicas of a file.
+    #
+    # @param self   The manager to register this file
+    # @param file   The File object
+    def get_file_replica_count(self, file):
+        return cvine.vine_file_replica_count(self._taskvine, file._file)
+
+
+##
+# @class ndcctools.taskvine.manager.Factory
+# Launch a taskvine factory.
+#
+# The command line arguments for `vine_factory` can be set for a
+# factory object (with dashes replaced with underscores). Creating a factory
+# object does not immediately launch it, so this is a good time to configure
+# the resources, number of workers, etc. Factory objects function as Python
+# context managers, so to indicate that a set of commands should be run with
+# a factory running, wrap them in a `with` statement. The factory will be
+# cleaned up automatically at the end of the block. You can also make
+# config changes to the factory while it is running. As an example,
+#
+#     # normal vine setup stuff
+#     workers = ndcctools.taskvine.Factory("sge", "myproject")
+#     workers.cores = 4
+#     with workers:
+#         # submit some tasks
+#         workers.max_workers = 300
+#         # got a pile of tasks, allow more workers
+#     # any additional cleanup steps on the manager
+class Factory(object):
+    _command_line_options = [
+        "amazon-config",
+        "autosize",
+        "batch-options",
+        "batch-type",
+        "capacity",
+        "catalog",
+        "condor-requirements",
+        "config-file",
+        "cores",
+        "debug",
+        "debug-file",
+        "debug-file-size",
+        "disk",
+        "env",
+        "extra-options",
+        "factory-timeout",
+        "foremen-name",
+        "gpus",
+        "k8s-image",
+        "k8s-worker-image",
+        "max-workers",
+        "manager-name",
+        "memory",
+        "mesos-master",
+        "mesos-path",
+        "mesos-preload",
+        "min-workers",
+        "password",
+        "python-env",
+        "python-package",
+        "run-factory-as-manager",
+        "runos",
+        "scratch-dir",
+        "ssl",
+        "tasks-per-worker",
+        "timeout",
+        "worker-binary",
+        "workers-per-cycle",
+        "wrapper",
+        "wrapper-input",
+    ]
+
+    # subset of command line options that can be written to the configuration
+    # file, and therefore they can be changed once the factory is running.
+    _config_file_options = [
+        "autosize",
+        "capacity",
+        "cores",
+        "disk",
+        "factory-timeout",
+        "foremen-name",
+        "manager-name",
+        "max-workers",
+        "memory",
+        "min-workers",
+        "tasks-per-worker",
+        "timeout",
+        "workers-per-cycle",
+        "condor-requirements",
+    ]
+
+    # subset of command line options that need special handling once the factory object has been created.
+    _config_init_options = [
+        "batch-type",
+        "manager-name",
+    ]
+
+    ##
+    # Create a factory for the given batch_type and manager name.
+    #
+    # One of `manager_name`, `manager_host_port`, or `manager` should be specified.
+    # If factory_binary or worker_binary is not
+    # specified, $PATH will be searched.
+    def __init__(self, batch_type="local", manager=None, manager_host_port=None, manager_name=None, factory_binary=None, worker_binary=None, log_file=os.devnull):
+        self._config_file = None
+        self._factory_proc = None
+        self._log_file = log_file
+        self._error_file = None
+
+        self._opts = {}
+
+        self._set_manager(batch_type, manager, manager_host_port, manager_name)
+
+        self._opts["batch-type"] = batch_type
+        self._opts["worker-binary"] = self._find_exe(worker_binary, "vine_worker")
+        self._factory_binary = self._find_exe(factory_binary, "vine_factory")
+
+        self._opts["scratch-dir"] = None
+        if manager:
+            # we really would want to use the staging path of the manager, but
+            # since the manager may cleanup before the factory terminates,
+            # we need to use some other directory.
+            self._opts["scratch-dir"] = os.path.dirname(manager.staging_directory)
+            pathlib.Path.mkdir(pathlib.Path(self._opts["scratch-dir"]), exist_ok=True, parents=True)
+
+    def _set_manager(self, batch_type, manager, manager_host_port, manager_name):
+        if manager:
+            if manager.using_ssl:
+                self._opts["ssl"] = True
+            if batch_type == "local":
+                manager_host_port = f"localhost:{manager.port}"
+            elif manager.name:
+                if manager_name:
+                    if manager.name != manager_name:
+                        RuntimeError(
+                            "The manager and Factory were assigned different names ({manager.name}, {manager_name})"
+                        )
+                else:
+                    manager_name = manager.name
+
+        if manager_host_port:
+            try:
+                (host, port) = [x for x in manager_host_port.split(":") if x]
+                self._opts["manager-host"] = host
+                self._opts["manager-port"] = port
+                return
+            except (TypeError, ValueError):
+                raise ValueError("manager_host_port is not of the form HOST:PORT")
+        elif manager_name:
+            self._opts["manager-name"] = manager_name
+        else:
+            raise ValueError("Either manager, manager_host_port, or manager_name or manager should be specified.")
+
+    def _find_exe(self, path, default):
+        if path is None:
+            out = shutil.which(default)
+        else:
+            out = path
+        if out is None or not os.access(out, os.F_OK):
+            raise OSError(errno.ENOENT, "Command not found", out or default)
+        if not os.access(out, os.X_OK):
+            raise OSError(errno.EPERM, os.strerror(errno.EPERM), out)
+        return os.path.abspath(out)
+
+    def __getattr__(self, name):
+        if name[0] == "_":
+            # For names that start with '_', immediately return the attribute.
+            # If the name does not start with '_' we assume is a factory option.
+            return object.__getattribute__(self, name)
+
+        # original command line options use - instead of _. _ is required by
+        # the naming conventions of python (otherwise - is taken as 'minus')
+        name_with_hyphens = name.replace("_", "-")
+
+        if name_with_hyphens in Factory._command_line_options:
+            try:
+                return object.__getattribute__(self, "_opts")[name_with_hyphens]
+            except KeyError:
+                raise KeyError("{} is a valid factory attribute, but has not been set yet.".format(name))
+        else:
+            raise AttributeError("{} is not a supported option".format(name))
+
+    def __setattr__(self, name, value):
+        # original command line options use - instead of _. _ is required by
+        # the naming conventions of python (otherwise - is taken as 'minus')
+        name_with_hyphens = name.replace("_", "-")
+
+        if name[0] == "_":
+            # For names that start with '_', immediately set the attribute.
+            # If the name does not start with '_' we assume is a factory option.
+            object.__setattr__(self, name, value)
+        elif self._factory_proc:
+            # if factory is already running, only accept attributes that can
+            # changed dynamically
+            if name_with_hyphens in Factory._config_file_options:
+                self._opts[name_with_hyphens] = value
+                self._write_config()
+            elif name_with_hyphens in Factory._command_line_options:
+                raise AttributeError("{} cannot be changed once the factory is running.".format(name))
+            else:
+                raise AttributeError("{} is not a supported option".format(name))
+        else:
+            if name_with_hyphens in Factory._config_init_options:
+                raise AttributeError("{} cannot be changed after the factory initial configuration.".format(name))
+
+            if name_with_hyphens in Factory._command_line_options:
+                self._opts[name_with_hyphens] = value
+            else:
+                raise AttributeError("{} is not a supported option".format(name))
+
+    def _construct_command_line(self):
+        # check for environment file
+        args = [self._factory_binary]
+
+        args += ["--parent-death"]
+        args += ["--config-file", self._config_file]
+
+        if self._opts["batch-type"] == "local":
+            self._opts["extra-options"] = self._opts.get("extra-options", "") + " --parent-death"
+
+        for opt in self._opts:
+            if opt not in Factory._command_line_options:
+                continue
+            if opt in Factory._config_file_options:
+                continue
+            if self._opts[opt] is True:
+                args.append("--{}".format(opt))
+            else:
+                args.append("--{}={}".format(opt, self._opts[opt]))
+
+        if "manager-host" in self._opts:
+            args += [self._opts["manager-host"], self._opts["manager-port"]]
+
+        return args
+
+    ##
+    # Start a factory process.
+    #
+    # It's best to use a context manager (`with` statement) to automatically
+    # handle factory startup and tear-down. If another mechanism will ensure
+    # cleanup (e.g. running inside a container), manually starting the factory
+    # may be useful to provision workers from inside a Jupyter notebook.
+    def start(self):
+        if self._factory_proc is not None:
+            # if factory already running, just update its config
+            self._write_config()
+            return
+
+        if not self.scratch_dir:
+            candidate = os.getcwd()
+            if candidate.startswith("/afs") and self.batch_type == "condor":
+                candidate = os.environ.get("TMPDIR", "/tmp")
+            candidate = os.path.join(candidate, f"vine-factory-{os.getuid()}")
+            if not os.path.exists(candidate):
+                os.makedirs(candidate, exist_ok=True)
+            self.scratch_dir = candidate
+
+        # specialize scratch_dir for this run
+        self._scratch_dir_run = tempfile.mkdtemp(prefix="vine-factory-", dir=self.scratch_dir)
+        atexit.register(lambda: shutil.rmtree(self._scratch_dir_run, ignore_errors=True))
+
+        self._error_file = os.path.join(self._scratch_dir_run, "error.log")
+        self._config_file = os.path.join(self._scratch_dir_run, "config.json")
+
+        self._write_config()
+        logfd = open(self._log_file, "a")
+        errfd = open(self._error_file, "w")
+        devnull = open(os.devnull, "w")
+        self._factory_proc = subprocess.Popen(self._construct_command_line(), stdin=devnull, stdout=logfd, stderr=errfd)
+        devnull.close()
+        logfd.close()
+        errfd.close()
+
+        # ugly... give factory time to read configuration file
+        time.sleep(1)
+
+        status = self._factory_proc.poll()
+        if status:
+            with open(self._error_file) as error_f:
+                error_log = error_f.read()
+                raise RuntimeError("Could not execute vine_factory. Exited with status: {}\n{}".format(str(status), error_log))
+        return self
+
+    ##
+    # Stop the factory process.
+    def stop(self):
+        if self._factory_proc is not None:
+            self._factory_proc.terminate()
+            self._factory_proc.wait()
+        self._factory_proc = None
+        self._config_file = None
+
+    def __enter__(self):
+        return self.start()
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.stop()
+
+    def __del__(self):
+        try:
+            self.stop()
+        except TypeError:
+            pass
+
+    def _write_config(self):
+        if self._config_file is None:
+            return
+
+        opts_subset = dict([(opt, self._opts[opt]) for opt in self._opts if opt in Factory._config_file_options])
+        with open(self._config_file, "w") as f:
+            json.dump(opts_subset, f, indent=4)
+
+    def set_environment(self, env):
+        self._env_file = env
+
+# vim: set sts=4 sw=4 ts=4 expandtab ft=python:
