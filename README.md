@@ -73,6 +73,10 @@ See **Running Fidelis Replay** below.
   from source (Ubuntu/Debian: `apt-get install build-essential`). Not
   required if you use the prebuilt binaries — see **Building PTU and the
   interposition libraries**.
+- [Apptainer](https://apptainer.org/docs/user/main/quick_start.html) —
+  only needed for the **Fidelis Replay** condition (`apptainer exec` runs
+  the workload inside a previously captured `audit.sif`). Not required
+  for the other six conditions.
 
 ## Installing the modified TaskVine
 
