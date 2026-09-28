@@ -50,6 +50,12 @@ context reuse) and the choice of materialization timing:
 | ptrace + reuse | `ptu` | `TASKVINE_WARM_POOL=1` |
 | Interposition only (sync) | `libptu-sync/libptu-launcher` | `VINE_AUDIT_MODE=1` |
 | Interposition + reuse (sync) | `libptu-sync/libptu-launcher` | `TASKVINE_WARM_POOL=1 VINE_AUDIT_MODE=1` |
+| Fidelis Replay | `apptainer exec` into a previously captured `audit.sif` | `TASKVINE_WARM_POOL=1 VINE_REPLAY_MODE=1` |
+
+Fidelis Replay is a seventh, separate condition: rather than auditing a
+fresh execution, it replays a workflow entirely inside the SIF container
+captured by a prior Full Fidelis run, with no new capture taking place.
+See **Running Fidelis Replay** below.
 
 ## System requirements
 
@@ -85,6 +91,17 @@ unmodified — the context-reuse mechanism is entirely on the Python side.
 
 ## Building PTU and the interposition libraries
 
+Prebuilt Linux x86-64 binaries are included directly in this repo
+(`provenance-to-use/ptu`, `libptu/libptu-launcher`,
+`libptu/libptu-materialize`, `libptu-sync/libptu-launcher`,
+`libptu-sync/libptu-materialize`), built and tested on Ubuntu 22.04. If
+your target machine matches that architecture/ABI, no build step is
+required — just make sure the binaries are executable (`chmod +x`) after
+cloning.
+
+To build from source instead (e.g. for a different distribution or to
+verify the binaries yourself):
+
 ```bash
 cd provenance-to-use && ./run.sh -r        # release build
 cd ../libptu && make
@@ -119,6 +136,39 @@ The `cluster_driver_scripts/run_*.sh` files show the full end-to-end
 pattern per workflow: submit the worker sbatch job, wait for it to reach
 `RUNNING`, launch the manager with the condition's environment variables,
 then cancel the worker job once the manager exits.
+
+## Running Fidelis Replay
+
+Fidelis Replay runs a workflow's manager and workers entirely inside the
+`audit.sif` containers captured during a prior Full Fidelis (async) run,
+using `apptainer exec` with `VINE_REPLAY_MODE=1` instead of
+`VINE_AUDIT_MODE=1` — no new interposition/capture happens, the goal is to
+verify the previously captured environment reproduces the run.
+
+`cluster_driver_scripts/` includes:
+
+- `replay_manager_only.sh` — replays just the manager inside its captured
+  SIF, against unaudited workers you start separately. This is the
+  reliable path: every Full Fidelis run in this study produced a
+  manager-side `audit.sif`.
+- `replay_full.sbatch` + `run_replay_full.sh` — replays *both* the manager
+  and the workers inside their captured SIFs, matching the original
+  design (`ablation_study_plan.md` §9.2 in our internal notes). This
+  requires a **worker-side** `audit.sif` as well.
+
+**Worker-side replay caveat:** a worker only produces its own `audit.sif`
+if it reaches its `LIBPTU_BUILD_ON_EXIT` materialize handler before
+exiting. Our 8-node SLURM driver scripts (`cluster_driver_scripts/*_workers_fidelis*.sbatch`,
+used for every workflow's medium-scale ablation run in this study,
+including the two new hybrid workflows) `scancel` the worker job as soon
+as the manager finishes — which is *before* that handler runs. As a
+result, those runs' worker directories are empty and only manager-side
+replay (`replay_manager_only.sh`) is possible for them. Genuine per-worker
+captures do exist from this project's original, non-ablation two-node
+deployment; run `run_replay_full.sh` against those. To capture your own
+worker-side SIF, remove or delay the `scancel` call in a `*_workers_fidelis*`
+run and let the worker process exit on its own after the manager
+completes.
 
 ## Interpreting output
 
