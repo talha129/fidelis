@@ -84,32 +84,47 @@ The `taskvine/` directory in this repo contains only the Python bindings
 subtree (`ndcctools.taskvine`) with the context-reuse patch applied, not a
 full standalone build of cctools — the C-side worker/manager binaries are
 unmodified upstream TaskVine, so there's no need to build cctools from
-scratch. Per workflow conda env:
-
-```bash
-# 1. Create the env and install stock TaskVine (brings vine_worker, vine_manager,
-#    and the unmodified C bindings) plus the workflow's own dependencies:
-conda create -n <workflow-env> -c conda-forge -c bioconda python=3.11 \
-    ndcctools=7.17.0 <workflow-specific packages...> -y
-conda activate <workflow-env>
-
-# 2. Overlay this repo's modified Python files onto the installed package,
-#    replacing manager.py/task.py/dask_executor.py/__init__.py and adding
-#    warm_manager.py:
-cp taskvine/taskvine/src/bindings/python3/ndcctools/taskvine/*.py \
-   "$(python3 -c 'import ndcctools.taskvine, os; print(os.path.dirname(ndcctools.taskvine.__file__))')/"
-
-# 3. Verify the patch took effect:
-python3 -c "import ndcctools.taskvine as vine; print(hasattr(vine, 'warm_manager'))"   # expect True
-```
+scratch.
 
 **Version pin matters**: the patch is against `ndcctools==7.17.0`
 specifically (`manager.py`/`task.py` internals it modifies can drift
 between TaskVine releases) — install that exact version, not `latest`.
+Every env created below pins it for you.
 
-Repeat step 1-2 once per workflow-specific conda env (see per-workflow
-package lists in **System requirements** and **Running a workflow**
-below); step 2's overlay is identical across all of them.
+### Step 1: create each workflow's conda env
+
+The driver scripts in `cluster_driver_scripts/` hardcode these exact env
+names (`conda activate <name>`), so create them with these names —
+anything else and the driver scripts will fail at `conda activate`.
+
+| Workflow | Env name | Create with |
+|---|---|---|
+| MapReduce | `map-reduce` | `conda env create -f libptu/dataset/dask-taskvine-mapreduce-benchmark/software/environment.yml` |
+| CTrend | `ctrend` | `conda env create -f libptu/dataset/climate_trend/software/environment.yml` |
+| DConv | `dconv` | `conda env create -f libptu/dataset/distributed_image_convolution/software/environment.yml` |
+| DV5 | `dv5` | `conda env create -f libptu/dataset/cms-physics-dv5/software/dv5-env.yml` |
+| RAG | `rag` | `conda create -n rag -c conda-forge python=3.11 ndcctools=7.17.0 langchain-text-splitters -y` |
+| Minimap2 | `minimap2-sv` | `conda create -n minimap2-sv -c conda-forge -c bioconda python=3.11 ndcctools=7.17.0 minimap2 samtools -y` |
+| GATK | `gatk-hc` | `conda create -n gatk-hc -c conda-forge -c bioconda python=3.11 ndcctools=7.17.0 gatk4 bwa samtools -y` |
+
+The four `environment.yml`-based envs already include a pinned
+`ndcctools=7.17.0` alongside each workflow's own dependencies
+(`pandas`/`numpy`/`matplotlib` for CTrend, `numpy`/`pillow` for DConv,
+`dask`/`distributed` for MapReduce, `coffea`/`dask-awkward`/`awkward`/
+`fastjet` plus a C toolchain for DV5's fastjet build).
+
+### Step 2: overlay the warm-pool patch
+
+Repeat this once per env created above, with that env active:
+
+```bash
+conda activate <env-name>   # e.g. ctrend, dconv, dv5, map-reduce, rag, minimap2-sv, gatk-hc
+cp taskvine/taskvine/src/bindings/python3/ndcctools/taskvine/*.py \
+   "$(python3 -c 'import ndcctools.taskvine, os; print(os.path.dirname(ndcctools.taskvine.__file__))')/"
+
+# Verify the patch took effect:
+python3 -c "import ndcctools.taskvine as vine; print(hasattr(vine, 'warm_manager'))"   # expect True
+```
 
 ## Building PTU and the interposition libraries
 

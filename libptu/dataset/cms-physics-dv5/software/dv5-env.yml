@@ -14,7 +14,7 @@ dependencies:
   - libopenssl-static
   - openssl
   - cloudpickle
-  - ndcctools
+  - ndcctools=7.17.0
   - pip
   - pip:
     - fastjet==3.4.2.1
