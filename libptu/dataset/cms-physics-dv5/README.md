@@ -1,3 +1,0 @@
-```bash
-floability run --backpack .
-```
