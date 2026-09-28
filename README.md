@@ -188,29 +188,45 @@ the corresponding flag if you place data elsewhere):
 | Minimap2 | `--reference-dir`, `--data-dir` | none (explicit) | generated |
 | GATK | `--reference-dir`, `--bam-dir`, `--intervals-dir` | none (explicit) | generated |
 
-## Running a workflow
+## Running an experiment (all six conditions, per workflow)
 
-General pattern for any workflow, any condition:
+Every `cluster_driver_scripts/run_*.sh` script does the same thing: submit
+the worker sbatch job for one condition, wait for it to reach `RUNNING`,
+launch the manager with that condition's environment variables, wait for
+it to finish, then cancel the worker job. This is the actual set of
+scripts used to produce this study's results — no command construction
+required, just point one at a scale and run it.
 
-1. Create a workflow-specific conda env (see **System requirements**) with
-   `ndcctools` patched per **Installing the modified TaskVine**.
-2. Launch workers on your cluster using the matching
-   `cluster_driver_scripts/*_workers_*.sbatch` file for the condition you
-   want (this is what applies `ptu`, `libptu-launcher`, or
-   `libptu-sync/libptu-launcher` around `vine_worker`, per the condition
-   table above). **Before running**: replace `<MANAGER_HOST>` and
-   `<MANAGER_INTERNAL_IP>` placeholders with your own manager node's
-   address, and adjust the hardcoded `/shared/...` paths (NFS-mounted
-   shared storage in our deployment) to wherever this repo lives on your
-   cluster.
-3. Run the workflow's benchmark script (below) from
-   `libptu/dataset/<workflow>/workflow/`, with `TASKVINE_WARM_POOL=1`
-   and/or `VINE_AUDIT_MODE=1` prefixed per the condition table.
+**Before running any of these**: replace the `<MANAGER_HOST>` and
+`<MANAGER_INTERNAL_IP>` placeholders in the corresponding
+`cluster_driver_scripts/*_workers_*.sbatch` files with your own manager
+node's address, and adjust the hardcoded `/shared/...` paths to wherever
+this repo lives on your cluster.
 
-The `cluster_driver_scripts/run_*.sh` files show the full end-to-end
-pattern per workflow: submit the worker sbatch job, wait for it to reach
-`RUNNING`, launch the manager with the condition's environment variables,
-then cancel the worker job once the manager exits.
+| Workflow | Small scale | Medium scale | Large scale |
+|---|---|---|---|
+| MapReduce | `run_mr_small_all4.sh` + `run_mr_small_sync.sh` | *(no unified script — run `run_mr_base_medium.sh`, `run_mr_base_audit_medium.sh`, `run_mr_fidelis_medium.sh`, `run_mr_ptrace_reuse_medium.sh` individually)* + `run_mr_libptu_sync.sh` | `run_mr_large_all4.sh` + `run_mr_large_sync.sh` |
+| CTrend | `run_ctrend_small_all4.sh` + `run_ctrend_small_sync.sh` | `run_ctrend_ablation_medium.sh` + `run_ctrend_libptu_sync.sh` | `run_ctrend_large_all4.sh` + `run_ctrend_large_sync.sh` |
+| DConv | `run_dconv_small_all4.sh` + `run_dconv_small_sync.sh` | `run_dconv_ablation_medium.sh` + `run_dconv_libptu_sync.sh` | `run_dconv_large_all4.sh` + `run_dconv_large_sync.sh` |
+| DV5 | `run_dv5_small_all4.sh` + `run_dv5_small_sync.sh` | `run_dv5_local_staging_all4.sh` + `run_dv5_libptu_sync.sh` | `run_dv5_large_all4.sh` + `run_dv5_large_sync.sh` |
+| RAG | `run_rag_small_all4.sh` + `run_rag_small_sync.sh` | `run_rag_local_staging_all4.sh` + `run_rag_libptu_sync.sh` | `run_rag_large_all4.sh` + `run_rag_large_sync.sh` |
+| Minimap2 | `run_mm2_small_smoke.sh` (Base Execution only) | `run_mm2_medium_all6.sh` (all 6 conditions in one script) | not run in this study |
+| GATK | not run in this study | `run_gatk_medium_all6.sh` (conditions 1-4) + `run_gatk_sync_remaining.sh` (conditions 5-6) | not run in this study |
+
+`*_all4` scripts cover Base Execution, Base Audit, Full Fidelis, and
+ptrace+reuse; `*_sync`/`*_libptu_sync` scripts cover Interposition Only
+and Interposition + Reuse; `*_all6` scripts cover all six in one run.
+MapReduce's medium scale is the one gap in this study's own script
+history — it was run condition-by-condition rather than through a single
+driver; the four scripts listed cover the same four conditions the
+`*_all4` scripts automate elsewhere.
+
+For a single workflow/condition/scale without going through a full driver
+script (e.g. to debug one condition in isolation), see the per-workflow
+example commands below and combine them with the worker wrapper and
+manager environment variables from the condition table above.
+
+## Running one workflow manually
 
 ### MapReduce (`dask-taskvine-mapreduce-benchmark/`)
 
