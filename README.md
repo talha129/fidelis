@@ -353,11 +353,6 @@ Figures 6-8), not diffing against a bundled reference CSV. Concretely:
    will vary run-to-run (see the single-run-measurement caveat below);
    the relative ordering and rough magnitude across conditions is the
    claim to check.
-4. For the two hybrid workflows (`minimap2_sv`, `gatk_hc`), the expected
-   result is different and is stated explicitly in the paper: audit
-   overhead still improves modestly under Fidelis, but execution context
-   reuse provides little to no benefit, since these workflows dispatch
-   compiled binaries rather than Python function calls.
 
 ## Known limitations
 
