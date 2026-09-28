@@ -7,7 +7,7 @@ modified TaskVine execution-context-reuse mechanism it depends on, and the
 seven benchmark workflows and cluster orchestration scripts used to produce
 the paper's evaluation.
 
-**Badges requested:** Artifacts Available, Artifacts Functional.
+**Badges requested:** Artifacts Available, Artifacts Functional, Results Reproduced.
 
 ## What's in this repository
 
@@ -180,13 +180,36 @@ workflows that don't expose it directly (DV5, and the two hybrid
 workflows). A successful run has `tasks_successful` equal to the expected
 task count and zero `tasks_failed`.
 
+## Reproducing the paper's results
+
+This repository does not include the specific run-by-run results, the
+ablation-study tracking spreadsheet, or the paper's figure-generation
+scripts — reproduction means re-running the conditions above yourself and
+comparing against the numbers published in the paper (Sections 5.2.1-5.2.3,
+Figures 6-8), not diffing against a bundled reference CSV. Concretely:
+
+1. For each of the five original workflows (`dask-taskvine-mapreduce-benchmark`,
+   `climate_trend`, `distributed_image_convolution`, `cms-physics-dv5`,
+   `rag-lite-bm25`), run all six audit conditions at the paper's stated
+   scales (task counts are documented per workflow/scale in each
+   workflow's own generator script).
+2. Record each condition's Workflow Time, Avg Task Time, and Throughput
+   as described in **Interpreting output**.
+3. Compare against the paper: Fidelis audit should reduce workflow time by
+   roughly the percentages stated in Section 5.2.1 relative to base
+   execution and base audit, and per-task time and throughput should show
+   the corresponding improvements in Sections 5.2.2-5.2.3. Exact figures
+   will vary run-to-run (see the single-run-measurement caveat below);
+   the relative ordering and rough magnitude across conditions is the
+   claim to check.
+4. For the two hybrid workflows (`minimap2_sv`, `gatk_hc`), the expected
+   result is different and is stated explicitly in the paper: audit
+   overhead still improves modestly under Fidelis, but execution context
+   reuse provides little to no benefit, since these workflows dispatch
+   compiled binaries rather than Python function calls.
+
 ## Known limitations
 
-- This repository packages the audit/replay system, workflows, and cluster
-  orchestration; it does not include the specific experiment results,
-  ablation-study tracking spreadsheet, or paper-figure-generation scripts.
-  Reproducing the paper's exact published numbers requires re-running the
-  conditions above and independently aggregating the output.
 - Figures in the paper average over repeated runs are not available;
   single-run measurements were used throughout.
 - Execution context reuse (`TASKVINE_WARM_POOL`) provides negligible
