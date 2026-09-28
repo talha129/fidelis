@@ -113,29 +113,103 @@ the worker-wrapper commands in the table above.
 
 ## Running a workflow
 
+General pattern for any workflow, any condition:
+
 1. Create a workflow-specific conda env (see **System requirements**) with
    `ndcctools` patched per **Installing the modified TaskVine**.
-2. Launch workers on your cluster using the matching `cluster_driver_scripts/*_workers_*.sbatch`
-   file for the condition you want. **Before running**: replace
-   `<MANAGER_HOST>` and `<MANAGER_INTERNAL_IP>` placeholders in the sbatch
-   files with your own manager node's address, and adjust the hardcoded
-   `/shared/...` paths (NFS-mounted shared storage in our deployment) to
-   wherever `libptu-launcher`/`libptu-sync`'s launcher lives on your
+2. Launch workers on your cluster using the matching
+   `cluster_driver_scripts/*_workers_*.sbatch` file for the condition you
+   want (this is what applies `ptu`, `libptu-launcher`, or
+   `libptu-sync/libptu-launcher` around `vine_worker`, per the condition
+   table above). **Before running**: replace `<MANAGER_HOST>` and
+   `<MANAGER_INTERNAL_IP>` placeholders with your own manager node's
+   address, and adjust the hardcoded `/shared/...` paths (NFS-mounted
+   shared storage in our deployment) to wherever this repo lives on your
    cluster.
-3. Run the workflow's benchmark script from `libptu/dataset/<workflow>/workflow/`,
-   e.g.:
-   ```bash
-   python3 minimap2_benchmark.py --scheduler taskvine \
-       --reference-dir <ref-dir> --data-dir <data-dir> --cores-per-task 2 --ports 9123 9150
-   ```
-   Each benchmark script accepts `--name`/`--ports` (or reads
-   `VINE_MANAGER_NAME`/`VINE_MANAGER_PORTS`) to connect to the manager
-   started by the matching driver script.
+3. Run the workflow's benchmark script (below) from
+   `libptu/dataset/<workflow>/workflow/`, with `TASKVINE_WARM_POOL=1`
+   and/or `VINE_AUDIT_MODE=1` prefixed per the condition table.
 
 The `cluster_driver_scripts/run_*.sh` files show the full end-to-end
 pattern per workflow: submit the worker sbatch job, wait for it to reach
 `RUNNING`, launch the manager with the condition's environment variables,
 then cancel the worker job once the manager exits.
+
+### MapReduce (`dask-taskvine-mapreduce-benchmark/`)
+
+```bash
+cd libptu/dataset/dask-taskvine-mapreduce-benchmark/workflow
+python3 mapreduce_benchmark.py --generate --input-dir /shared/map-reduce-data --num-files 1024   # one-time
+python3 mapreduce_benchmark.py --scheduler taskvine --port 9123 --name mr-base \
+    --input-dir /shared/map-reduce-data --num-files 1024 --combine-width 2
+```
+
+### CTrend (`climate_trend/`)
+
+```bash
+cd libptu/dataset/climate_trend/workflow
+python3 climate_trend_benchmark.py --name ctrend-base --ports 9123 9150 \
+    --num-files 1500 --data-source data/csv_index.json --output-dir /shared/ctrend-data
+```
+
+### DConv (`distributed_image_convolution/`)
+
+```bash
+cd libptu/dataset/distributed_image_convolution/workflow
+python3 image_convolution_benchmark.py --name dconv-base --ports 9123 9150 \
+    --images npp.jpg --kernels sharpen --tile-size 256 --output-dir output
+```
+
+### DV5 (`cms-physics-dv5/`)
+
+```bash
+cd libptu/dataset/cms-physics-dv5/workflow
+python3 dv5_benchmark.py --preprocess --sub-dataset hgg_1 --num-files 20   # one-time: caches samples_ready.json
+python3 dv5_benchmark.py --name dv5-base --ports 9123 9150 \
+    --sub-dataset hgg_1 --num-files 20 --samples-ready samples_ready.json \
+    --data-dir /shared/dv5-data/samples --output-dir /shared/dv5-output
+```
+
+### RAG (`rag-lite-bm25/`)
+
+```bash
+cd libptu/dataset/rag-lite-bm25/workflow
+python3 rag_benchmark.py --name rag-base --ports 9123 9150 \
+    --num-files 2500 --data-dir /shared/rag-data --chunk-size 1000 --skip-query
+```
+
+### Minimap2 (`minimap2_sv/`)
+
+```bash
+cd libptu/dataset/minimap2_sv/workflow
+python3 02_generate_reference.py --output-dir reference                          # one-time
+python3 03_generate_long_reads.py --reference reference/genome.fa \
+    --annotations reference/genome_annotations.bed --output-dir data --windows 30  # one-time
+minimap2 -x map-ont -d reference/genome.mmi reference/genome.fa                  # one-time
+python3 minimap2_benchmark.py --scheduler taskvine --name mm2-base \
+    --reference-dir reference --data-dir data --cores-per-task 2 --ports 9123 9150
+```
+
+### GATK (`gatk_hc/`)
+
+```bash
+cd libptu/dataset/gatk_hc/workflow
+source ~/gatk_env.sh                              # sets $GATK; see 00_install.sh in the original workflow drop
+python3 01_generate_reference.py                  # one-time
+bash 02_index_reference.sh                        # one-time, requires $GATK
+python3 03_generate_reads.py                      # one-time
+bash 04_align_and_index.sh                        # one-time, requires $GATK, bwa, samtools
+python3 05_generate_intervals.py --intervals-per-chrom 1   # one-time
+python3 gatk_benchmark.py --scheduler taskvine --name gatk-base \
+    --reference-dir reference --bam-dir bam --intervals-dir intervals \
+    --cores-per-task 2 --heap 2g --ports 9123 9150
+```
+
+Each benchmark script accepts `--name`/`--ports` (or reads
+`VINE_MANAGER_NAME`/`VINE_MANAGER_PORTS`) to connect to the manager
+started by the matching driver script; scale (task count) is controlled by
+`--num-files` / `--windows` / `--intervals-per-chrom` as shown above —
+increase these for larger-scale runs.
 
 ## Running Fidelis Replay
 
