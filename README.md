@@ -7,8 +7,6 @@ modified TaskVine execution-context-reuse mechanism it depends on, and the
 seven benchmark workflows and cluster orchestration scripts used to produce
 the paper's evaluation.
 
-**Badges requested:** Artifacts Available, Artifacts Functional, Results Reproduced.
-
 ## What's in this repository
 
 | Directory | Contents |
@@ -394,17 +392,10 @@ Figures 6-8), not diffing against a bundled reference CSV. Concretely:
    the relative ordering and rough magnitude across conditions is the
    claim to check.
 
-## Known limitations
+## Important Notes
 
 - Figures in the paper average over repeated runs are not available;
   single-run measurements were used throughout.
-- Execution context reuse (`TASKVINE_WARM_POOL`) provides negligible
-  benefit for the Minimap2 and GATK workflows, since their tasks shell out
-  to compiled binaries rather than making Python function calls — this is
-  a real, expected result of the mechanism's design (its module-signature
-  matching operates over Python bytecode), not a bug.
 - The elastic SLURM cluster used for the paper's evaluation is not
   included; `cluster_driver_scripts/` assumes SLURM (`sbatch`/`squeue`) is
-  available and configured on your own cluster — see **System
-  requirements** above for how to provision one (AWS ParallelCluster or a
-  local Slurm install).
+  available and configured on your own cluster.
