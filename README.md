@@ -62,7 +62,12 @@ See **Running Fidelis Replay** below.
 - Linux (tested on Ubuntu 22.04), x86_64
 - A SLURM cluster for the multi-node conditions above (tested on 8 nodes,
   2 vCPUs/node); a single machine is sufficient to exercise Fidelis itself
-  at small scale, just without the SLURM orchestration layer
+  at small scale, just without the SLURM orchestration layer. If you don't
+  already have a SLURM cluster, the one used for this paper's evaluation
+  was provisioned with [AWS ParallelCluster](https://docs.aws.amazon.com/parallelcluster/latest/ug/what-is-aws-parallelcluster.html),
+  which sets up `sbatch`/`squeue` and shared storage automatically on EC2;
+  a local [Slurm quick-start install](https://slurm.schedmd.com/quickstart_admin.html)
+  works as well for a single-machine or bare-metal multi-node setup.
 - [Miniconda/Miniforge](https://github.com/conda-forge/miniforge)
 - Per-workflow tool dependencies, installed via conda:
   - `ndcctools` (TaskVine; see **Installing the modified TaskVine** below)
@@ -400,4 +405,6 @@ Figures 6-8), not diffing against a bundled reference CSV. Concretely:
   matching operates over Python bytecode), not a bug.
 - The elastic SLURM cluster used for the paper's evaluation is not
   included; `cluster_driver_scripts/` assumes SLURM (`sbatch`/`squeue`) is
-  available and configured on your own cluster.
+  available and configured on your own cluster — see **System
+  requirements** above for how to provision one (AWS ParallelCluster or a
+  local Slurm install).
