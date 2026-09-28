@@ -69,47 +69,124 @@ See **Running Fidelis Replay** below.
   - MapReduce/CTrend/DConv/DV5/RAG: `numpy`, `dask`, workflow-specific packages (`pandas`, `Pillow`, `awkward`/`uproot`/`coffea` for DV5, `langchain` for RAG)
   - Minimap2 workflow: `minimap2`, `samtools`
   - GATK workflow: `gatk4`, `bwa`, `samtools`
-- A C toolchain (gcc/make) to build `provenance-to-use`, `libptu`, and `libptu-sync`
+- A C toolchain to build `provenance-to-use`, `libptu`, and `libptu-sync`
+  from source (Ubuntu/Debian: `apt-get install build-essential`). Not
+  required if you use the prebuilt binaries — see **Building PTU and the
+  interposition libraries**.
 
 ## Installing the modified TaskVine
 
 The `taskvine/` directory in this repo contains only the Python bindings
 subtree (`ndcctools.taskvine`) with the context-reuse patch applied, not a
-full standalone build of cctools. The tested path is:
+full standalone build of cctools — the C-side worker/manager binaries are
+unmodified upstream TaskVine, so there's no need to build cctools from
+scratch. Per workflow conda env:
 
 ```bash
-conda install -c conda-forge ndcctools=7.17.0   # installs stock TaskVine (C binaries + Python bindings)
-# then overlay the modified Python files from this repo onto the installed package:
+# 1. Create the env and install stock TaskVine (brings vine_worker, vine_manager,
+#    and the unmodified C bindings) plus the workflow's own dependencies:
+conda create -n <workflow-env> -c conda-forge -c bioconda python=3.11 \
+    ndcctools=7.17.0 <workflow-specific packages...> -y
+conda activate <workflow-env>
+
+# 2. Overlay this repo's modified Python files onto the installed package,
+#    replacing manager.py/task.py/dask_executor.py/__init__.py and adding
+#    warm_manager.py:
 cp taskvine/taskvine/src/bindings/python3/ndcctools/taskvine/*.py \
    "$(python3 -c 'import ndcctools.taskvine, os; print(os.path.dirname(ndcctools.taskvine.__file__))')/"
+
+# 3. Verify the patch took effect:
+python3 -c "import ndcctools.taskvine as vine; print(hasattr(vine, 'warm_manager'))"   # expect True
 ```
 
-This replaces `manager.py`, `task.py`, `dask_executor.py`,
-`compat/dask_executor.py`, `__init__.py`, and adds `warm_manager.py`, while
-reusing the conda package's compiled `vine_worker`/`vine_manager` binaries
-unmodified — the context-reuse mechanism is entirely on the Python side.
+**Version pin matters**: the patch is against `ndcctools==7.17.0`
+specifically (`manager.py`/`task.py` internals it modifies can drift
+between TaskVine releases) — install that exact version, not `latest`.
+
+Repeat step 1-2 once per workflow-specific conda env (see per-workflow
+package lists in **System requirements** and **Running a workflow**
+below); step 2's overlay is identical across all of them.
 
 ## Building PTU and the interposition libraries
 
-Prebuilt Linux x86-64 binaries are included directly in this repo
-(`provenance-to-use/ptu`, `libptu/libptu-launcher`,
-`libptu/libptu-materialize`, `libptu-sync/libptu-launcher`,
-`libptu-sync/libptu-materialize`), built and tested on Ubuntu 22.04. If
-your target machine matches that architecture/ABI, no build step is
-required — just make sure the binaries are executable (`chmod +x`) after
-cloning.
+Prebuilt Linux x86-64 binaries are included directly in this repo, built
+and tested on Ubuntu 22.04:
 
-To build from source instead (e.g. for a different distribution or to
-verify the binaries yourself):
+| File | What it is |
+|---|---|
+| `provenance-to-use/ptu` | ptrace-based audit wrapper (Base Audit condition) |
+| `libptu/libptu.so` | Async-materialization interposition library (LD_PRELOAD target) |
+| `libptu/libptu-launcher` | Launches a process with `libptu.so` preloaded |
+| `libptu/libptu-materialize` | Builds the SIF container from a captured manifest |
+| `libptu-sync/libptu.so`, `libptu-sync/libptu-launcher`, `libptu-sync/libptu-materialize` | Same three, sync-materialization variant |
+
+If your target machine matches that architecture/ABI, no build step is
+required — just make sure the binaries are executable (`chmod +x`) after
+cloning (git preserves the executable bit, but some hosting/zip pipelines
+don't). Verify before relying on them:
 
 ```bash
-cd provenance-to-use && ./run.sh -r        # release build
-cd ../libptu && make
-cd ../libptu-sync && make
+for f in provenance-to-use/ptu libptu/libptu.so libptu/libptu-launcher \
+         libptu/libptu-materialize libptu-sync/libptu.so \
+         libptu-sync/libptu-launcher libptu-sync/libptu-materialize; do
+    file "$f"        # expect: ELF 64-bit LSB ... x86-64 ...
+done
+libptu/libptu-launcher --help    # should print usage, not "permission denied" / "cannot execute"
 ```
 
-Each produces a `libptu-launcher` and `libptu-materialize` binary used by
-the worker-wrapper commands in the table above.
+To build from source instead (e.g. for a different distribution/arch, or
+to verify the binaries yourself):
+
+```bash
+cd provenance-to-use && ./run.sh -r        # release build; produces ptu
+cd ../libptu && make                       # produces libptu.so, libptu-launcher, libptu-materialize
+cd ../libptu-sync && make                  # same three, sync variant
+```
+
+No dependencies beyond a standard C toolchain (`libptu`/`libptu-sync`
+only use glibc/POSIX headers — no third-party libraries to install first).
+
+## Data
+
+Most workflows need no external data — MapReduce, Minimap2, and GATK
+generate their own synthetic input via the one-time steps shown in
+**Running a workflow**. The rest ship real input data directly in this
+repo, under each workflow's `workflow/data/` (or, for DConv, alongside
+the script):
+
+| Workflow | Data included | Size | Source |
+|---|---|---|---|
+| CTrend | 80 real per-station weather CSVs + `data/csv_index.json` | ~22 MB | public weather-station records |
+| DConv | `npp.jpg` | 16 MB | public NASA image |
+| RAG | `alice.txt`, `frankenstein.txt`, `shakespeare_complete.txt`, `pg64317.txt` | ~6 MB | public-domain Project Gutenberg texts |
+| DV5 | 4 CMS NanoAOD sample files (2 `qcd/800to1000`, 2 `diboson/zz`) + `samples_ready.json`, `triggers.json` | ~1 MB | CMS Open Data |
+
+This is enough to run every workflow at **small scale** exactly as shown
+in **Running a workflow**, with no download step.
+
+**Known gap — DV5 at medium/large scale**: the paper's medium (20 files)
+and large (60 files) DV5 scales draw from a different CMS sample subset
+(`hgg_1`) that is not included in this repo (the bundled 4 files are only
+enough for `qcd_800to1000`/`diboson_zz` at small scale). Reproducing DV5
+beyond small scale requires sourcing additional `hgg_1` NanoAOD files
+yourself and placing them under
+`libptu/dataset/cms-physics-dv5/workflow/data/samples/hgg_1/`, matching
+the directory structure of the samples already there, then re-running
+`dv5_benchmark.py --preprocess --sub-dataset hgg_1 --num-files <20 or 60>`
+to regenerate `samples_ready.json` for that subset.
+
+Data location expected by each workflow's default arguments (override with
+the corresponding flag if you place data elsewhere):
+
+| Workflow | Flag | Default | Included? |
+|---|---|---|---|
+| MapReduce | `--input-dir` | `/shared/map-reduce-data` | generated via `--generate` |
+| CTrend | `--data-source` | `data/csv_index.json` (relative to `workflow/`) | yes |
+| DConv | `--images` | `npp.jpg` (relative to `workflow/`) | yes |
+| DV5 | `--data-dir` | `/shared/dv5-data/samples` | small scale only, see above |
+| RAG | `--data-dir` | `/shared/rag-data` (script's own `data/` dir also works, see script) | yes |
+| Minimap2 | `--reference-dir`, `--data-dir` | none (explicit) | generated |
+| GATK | `--reference-dir`, `--bam-dir`, `--intervals-dir` | none (explicit) | generated |
 
 ## Running a workflow
 
